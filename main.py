@@ -60,7 +60,7 @@ TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
 async def fetch_pairs():
         async with _client() as client:
         r = await client.get(DEX_SEARCH)
-r.raise_for_status()
+        r.raise_for_status()
 return r.json().get("pairs", [])
 
 def minutes_since_ms(ms_epoch: int) -> float:
