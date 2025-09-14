@@ -45,8 +45,8 @@ last_scan_info = { # telemetry
 
 # ---------- HTTP CLIENT (pool + retries) ----------
 def _client():
-limits = httpx.Limits(max_connections=32, max_keepalive_connections=16)
-transport = httpx.AsyncHTTPTransport(retries=3)
+        limits = httpx.Limits(max_connections=32, max_keepalive_connections=16)
+        transport = httpx.AsyncHTTPTransport(retries=3)
 return httpx.AsyncClient(
 timeout=HTTP_TIMEOUT_SEC,
 headers={"Accept": "application/json"},
