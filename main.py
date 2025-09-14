@@ -65,7 +65,7 @@ return r.json().get("pairs", [])
 
 def minutes_since_ms(ms_epoch: int) -> float:
         if not ms_epoch:
-return math.inf
+                return math.inf
 created = datetime.fromtimestamp(ms_epoch/1000, tz=timezone.utc)
 now = datetime.now(tz=timezone.utc)
 return (now - created).total_seconds() / 60.0
