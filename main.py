@@ -19,7 +19,7 @@ HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "8.0"))
 NEAR_MISS_WINDOW_SEC = int(os.getenv("NEAR_MISS_WINDOW_SEC", "60")) # recheck near misses for 60s
 
 if not BOT_TOKEN or not CHAT_ID:
-log.error("Missing BOT_TOKEN or TELEGRAM_CHAT_ID.")
+        log.error("Missing BOT_TOKEN or TELEGRAM_CHAT_ID.")
 raise SystemExit(1)
 
 # ---------- STRICT / ORIGINAL DNA (UNCHANGED) ----------
