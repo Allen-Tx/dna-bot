@@ -172,7 +172,7 @@ try:
                                 hits += 1
                                 to_delete.append(ca)
                                 for ca in to_delete:
-                                near_miss.pop(ca, None)
+                                        near_miss.pop(ca, None)
 
 except Exception as e:
 last_scan_info["last_error"] = str(e)
