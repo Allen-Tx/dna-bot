@@ -210,8 +210,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Scanning once…")
-                await scan_once(context.application)
-                        await update.message.reply_text("Scan done.")
+        await scan_once(context.application)
+        await update.message.reply_text("Scan done.")
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
