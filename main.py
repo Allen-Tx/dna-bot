@@ -217,21 +217,21 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
                 await update.message.reply_text("Use: /check https://dexscreener.com/solana/<CA>")
 return
-        url = context.args[0].strip()
-                if "dexscreener.com/solana/" not in url:
-                        await update.message.reply_text("Only Solana links supported.")
+url = context.args[0].strip()
+        if "dexscreener.com/solana/" not in url:
+                await update.message.reply_text("Only Solana links supported.")
 return
-        ca = url.split("dexscreener.com/solana/")[-1].split("?")[0].strip()
+ca = url.split("dexscreener.com/solana/")[-1].split("?")[0].strip()
 try:
-async with _client() as client:
-r = await client.get(TOKEN_API.format(ca))
-r.raise_for_status()
-pairs = r.json().get("pairs", [])
+        async with _client() as client:
+        r = await client.get(TOKEN_API.format(ca))
+        r.raise_for_status()
+        pairs = r.json().get("pairs", [])
 except Exception as e:
 await update.message.reply_text(f"check error: {e}")
 return
-if not pairs:
-await update.message.reply_text("No data.")
+        if not pairs:
+        await update.message.reply_text("No data.")
 return
 p = pairs[0]
 ok, why, _ = strict_dna_pass(p)
