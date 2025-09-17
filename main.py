@@ -140,7 +140,7 @@ try:
 
 # main sweep
 for p in pairs:
-        ca = (p.get("baseToken") or {}).get("address", "")
+ca = (p.get("baseToken") or {}).get("address", "")
 if not ca:
 continue
 
