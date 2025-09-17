@@ -130,7 +130,7 @@ f"{url}"
 await app.bot.send_message(chat_id=CHAT_ID, text=text)
 
 async def scan_once(app: Application):
-        t0 = time.perf_counter()
+        to = time.perf_counter()
         last_scan_info["last_error"] = None
         hits = 0
 try:
@@ -138,44 +138,41 @@ try:
         last_scan_info["pairs"] = len(pairs)
         now = datetime.now(tz=timezone.utc)
 
-# main sweep
-for p in pairs:
-        ca = (p.get("baseToken") or {}).get("address", "")
-if not ca:
-        continue
-except Exception as e:
-        print("Error fetching pairs:", e)
-        pairs = []
+        # main sweep
+        for p in pairs:
+                ca = (p.get("baseToken") or {}).get("address", "")
+                if not ca:
+                        continue
 
-passed, why, near = strict_dna_pass(p)
-if passed:
-        last = last_alert_ts.get(ca)
-if not last or (now - last).total_seconds() >= ALERT_COOLDOWN_SEC:
-        await send_alert(app, p, why)
-                last_alert_ts[ca] = now
-                hits += 1
-                continue
+                passed, why, near = strict_dna_pass(p)
+                if passed:
+                        last = last_alert_ts.get(ca)
+                        if not last or (now - last).total_seconds() >= ALERT_COOLDOWN_SEC:
+                                await send_alert(app, p, why)
+                                last_alert_ts[ca] = now
+                                hits += 1
+                                        continue
 
-# track near-misses briefly
-if near and ca not in near_miss:
-near_miss[ca] = (p, now)
+                                        # track near-misses briefly
+                                        if near and ca not in near_miss:
+                                                near_miss[ca] = (p, now)
 
-# backfill near-misses
-to_delete = []
-for ca, (p0, t_first) in near_miss.items():
-if (now - t_first).total_seconds() > NEAR_MISS_WINDOW_SEC:
-to_delete.append(ca)
-continue
-passed, why, _ = strict_dna_pass(p0)
-if passed:
-last = last_alert_ts.get(ca)
-if not last or (now - last).total_seconds() >= ALERT_COOLDOWN_SEC:
-await send_alert(app, p0, f"Backfill: {why}")
-last_alert_ts[ca] = now
-hits += 1
-to_delete.append(ca)
-for ca in to_delete:
-near_miss.pop(ca, None)
+                                        # backfill near-misses
+                                        to_delete = []
+                                        for ca, (p0, t_first) in near_miss.items():
+                                                if (now - t_first).total_seconds() > NEAR_MISS_WINDOW_SEC:
+                                                        to_delete.append(ca)
+                                                                continue
+                                                                passed, why, _ = strict_dna_pass(p0)
+                                                                if passed:
+                                                                        last = last_alert_ts.get(ca)
+                                                                                if not last or (now - last).total_seconds() >= ALERT_COOLDOWN_SEC:
+                                                                                        await send_alert(app, p0, f"Backfill: {why}")
+                                                                                        last_alert_ts[ca] = now
+                                                                                        hits += 1
+                                                                                        to_delete.append(ca)
+                                                                                                for ca in to_delete:
+                                                                                                        near_miss.pop(ca, None)
 
 except Exception as e:
 last_scan_info["last_error"] = str(e)
