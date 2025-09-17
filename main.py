@@ -143,7 +143,6 @@ for p in pairs:
         ca = (p.get("baseToken") or {}).get("address", "")
 if not ca:
         continue
-
 except Exception as e:
         print("Error fetching pairs:", e)
         pairs = []
