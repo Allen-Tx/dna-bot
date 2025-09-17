@@ -168,11 +168,11 @@ try:
                                 last = last_alert_ts.get(ca)
                         if not last or (now - last).total_seconds() >= ALERT_COOLDOWN_SEC:
                                 await send_alert(app, p0, f"Backfill: {why}")
-                                        last_alert_ts[ca] = now
-                                        hits += 1
-                                        to_delete.append(ca)
-                                                for ca in to_delete:
-                                                        near_miss.pop(ca, None)
+                                last_alert_ts[ca] = now
+                                hits += 1
+                                to_delete.append(ca)
+                                        for ca in to_delete:
+                                        near_miss.pop(ca, None)
 
 except Exception as e:
 last_scan_info["last_error"] = str(e)
