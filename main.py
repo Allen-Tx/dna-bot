@@ -218,8 +218,8 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Use: /check https://dexscreener.com/solana/<CA>")
 return
 url = context.args[0].strip()
-        if "dexscreener.com/solana/" not in url:
-                await update.message.reply_text("Only Solana links supported.")
+if "dexscreener.com/solana/" not in url:
+        await update.message.reply_text("Only Solana links supported.")
 return
 ca = url.split("dexscreener.com/solana/")[-1].split("?")[0].strip()
 try:
