@@ -224,9 +224,9 @@ return
 ca = url.split("dexscreener.com/solana/")[-1].split("?")[0].strip()
 try:
         async with _client() as client:
-        r = await client.get(TOKEN_API.format(ca))
-        r.raise_for_status()
-        pairs = r.json().get("pairs", [])
+                r = await client.get(TOKEN_API.format(ca))
+                r.raise_for_status()
+                pairs = r.json().get("pairs", [])
 except Exception as e:
 await update.message.reply_text(f"check error: {e}")
 return
