@@ -100,13 +100,13 @@ if age_min > DNA["max_age_min"]:
         return False, f"Too old {age_min:.0f}m > {DNA['max_age_min']}m", False
 if vol1h < DNA["min_vol1h_usd"]:
         near = vol1h >= 0.8 * DNA["min_vol1h_usd"]
-                return False, f"Low vol1h ${vol1h:,.0f}", near
+        return False, f"Low vol1h ${vol1h:,.0f}", near
 if activity5 < DNA["min_m5_activity"]:
         near = activity5 >= max(1, int(0.8 * DNA["min_m5_activity"]))
-                return False, f"Low m5 activity {activity5}", near
+        return False, f"Low m5 activity {activity5}", near
 if m5_change < DNA["m5_change_tol"]:
         near = m5_change >= (DNA["m5_change_tol"] - 1.0)
-                return False, f"Weak m5 {m5_change:.1f}%", near
+        return False, f"Weak m5 {m5_change:.1f}%", near
 
 return True, "DNA PASS", False
 
