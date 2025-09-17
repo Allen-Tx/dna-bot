@@ -251,7 +251,7 @@ f"m5 Δ {m5:.1f}% | m5 activity {activity5} | age {age_min:.0f}m"
 )
 
 def main():
-app = Application.builder().token(BOT_TOKEN).build()
+        app = Application.builder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", cmd_start))
 app.add_handler(CommandHandler("status", cmd_status))
