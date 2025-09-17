@@ -140,18 +140,22 @@ try:
 
 # main sweep
 for p in pairs:
-ca = (p.get("baseToken") or {}).get("address", "")
+        ca = (p.get("baseToken") or {}).get("address", "")
 if not ca:
-continue
+        continue
+
+except Exception as e:
+        print("Error fetching pairs:", e)
+        pairs = []
 
 passed, why, near = strict_dna_pass(p)
 if passed:
-last = last_alert_ts.get(ca)
+        last = last_alert_ts.get(ca)
 if not last or (now - last).total_seconds() >= ALERT_COOLDOWN_SEC:
-await send_alert(app, p, why)
-last_alert_ts[ca] = now
-hits += 1
-continue
+        await send_alert(app, p, why)
+                last_alert_ts[ca] = now
+                hits += 1
+                continue
 
 # track near-misses briefly
 if near and ca not in near_miss:
