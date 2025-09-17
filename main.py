@@ -187,35 +187,35 @@ finally:
 
 # ---------- TELEGRAM ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-await update.message.reply_text(
-"Bot up ✅ (STRICT DNA)\n"
-f"Scan: {SCAN_INTERVAL}s | Cooldown: {ALERT_COOLDOWN_SEC}s | Near-miss: {NEAR_MISS_WINDOW_SEC}s"
-)
+        await update.message.reply_text(
+        "Bot up ✅ (STRICT DNA)\n"
+        f"Scan: {SCAN_INTERVAL}s | Cooldown: {ALERT_COOLDOWN_SEC}s | Near-miss: {NEAR_MISS_WINDOW_SEC}s"
+        )
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 info = last_scan_info
 ts = info["ts"].strftime("%Y-%m-%d %H:%M:%S UTC") if info["ts"] else "—"
 err = info["last_error"] or "none"
-await update.message.reply_text(
-"STRICT DNA (unchanged):\n"
-f"- Liq ≥ ${DNA['min_liq_usd']:,}\n"
-f"- FDV ≤ ${DNA['max_fdv_usd']:,}\n"
-f"- Age ≤ {DNA['max_age_min']}m\n"
-f"- 1h Vol ≥ ${DNA['min_vol1h_usd']:,}\n"
-f"- m5 activity ≥ {DNA['min_m5_activity']}\n"
-f"- m5 Δ ≥ {DNA['m5_change_tol']}% (tolerance)\n\n"
-f"Last scan: {ts} | pairs={info['pairs']} | hits={info['hits']} | {info['duration_ms']}ms\n"
-f"Last error: {err}"
-)
+        await update.message.reply_text(
+        "STRICT DNA (unchanged):\n"
+        f"- Liq ≥ ${DNA['min_liq_usd']:,}\n"
+        f"- FDV ≤ ${DNA['max_fdv_usd']:,}\n"
+        f"- Age ≤ {DNA['max_age_min']}m\n"
+        f"- 1h Vol ≥ ${DNA['min_vol1h_usd']:,}\n"
+        f"- m5 activity ≥ {DNA['min_m5_activity']}\n"
+        f"- m5 Δ ≥ {DNA['m5_change_tol']}% (tolerance)\n\n"
+        f"Last scan: {ts} | pairs={info['pairs']} | hits={info['hits']} | {info['duration_ms']}ms\n"
+        f"Last error: {err}"
+        )
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-await update.message.reply_text("Scanning once…")
-await scan_once(context.application)
-await update.message.reply_text("Scan done.")
+        await update.message.reply_text("Scanning once…")
+                await scan_once(context.application)
+                        await update.message.reply_text("Scan done.")
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-if not context.args:
-await update.message.reply_text("Use: /check https://dexscreener.com/solana/<CA>")
+        if not context.args:
+                await update.message.reply_text("Use: /check https://dexscreener.com/solana/<CA>")
 return
 url = context.args[0].strip()
 if "dexscreener.com/solana/" not in url:
