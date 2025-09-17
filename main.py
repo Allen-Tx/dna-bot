@@ -230,7 +230,7 @@ try:
 except Exception as e:
         await update.message.reply_text(f"check error: {e}")
 return
-        if not pairs:
+if not pairs:
         await update.message.reply_text("No data.")
 return
 p = pairs[0]
