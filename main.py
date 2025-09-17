@@ -111,15 +111,15 @@ if m5_change < DNA["m5_change_tol"]:
 return True, "DNA PASS", False
 
 async def send_alert(app: Application, p: dict, why: str):
-base = (p.get("baseToken") or {}).get("symbol", "?")
-url = p.get("url", "")
-liq = (p.get("liquidity") or {}).get("usd", 0) or 0
-fdv = p.get("fdv", 0) or 0
-vol1h = (p.get("volume") or {}).get("h1", 0) or 0
-tx5 = (p.get("txns") or {}).get("m5") or {}
-activity5 = (tx5.get("buys", 0) or 0) + (tx5.get("sells", 0) or 0)
-m5_change = (p.get("priceChange") or {}).get("m5", 0.0) or 0.0
-age_min = minutes_since_ms(p.get("pairCreatedAt", 0) or 0)
+        base = (p.get("baseToken") or {}).get("symbol", "?")
+        url = p.get("url", "")
+        liq = (p.get("liquidity") or {}).get("usd", 0) or 0
+        fdv = p.get("fdv", 0) or 0
+        vol1h = (p.get("volume") or {}).get("h1", 0) or 0
+        tx5 = (p.get("txns") or {}).get("m5") or {}
+        activity5 = (tx5.get("buys", 0) or 0) + (tx5.get("sells", 0) or 0)
+        m5_change = (p.get("priceChange") or {}).get("m5", 0.0) or 0.0
+        age_min = minutes_since_ms(p.get("pairCreatedAt", 0) or 0)
 
 text = (
 f"🚨 DING (STRICT DNA) [{base}] — {why}\n"
