@@ -228,7 +228,7 @@ try:
                 r.raise_for_status()
                 pairs = r.json().get("pairs", [])
 except Exception as e:
-await update.message.reply_text(f"check error: {e}")
+        await update.message.reply_text(f"check error: {e}")
 return
         if not pairs:
         await update.message.reply_text("No data.")
