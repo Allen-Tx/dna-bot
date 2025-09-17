@@ -130,17 +130,17 @@ f"{url}"
 await app.bot.send_message(chat_id=CHAT_ID, text=text)
 
 async def scan_once(app: Application):
-t0 = time.perf_counter()
-last_scan_info["last_error"] = None
-hits = 0
+        t0 = time.perf_counter()
+        last_scan_info["last_error"] = None
+        hits = 0
 try:
-pairs = await fetch_pairs()
-last_scan_info["pairs"] = len(pairs)
-now = datetime.now(tz=timezone.utc)
+        pairs = await fetch_pairs()
+        last_scan_info["pairs"] = len(pairs)
+        now = datetime.now(tz=timezone.utc)
 
 # main sweep
 for p in pairs:
-ca = (p.get("baseToken") or {}).get("address", "")
+        ca = (p.get("baseToken") or {}).get("address", "")
 if not ca:
 continue
 
