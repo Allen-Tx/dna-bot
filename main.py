@@ -175,15 +175,15 @@ try:
                                         near_miss.pop(ca, None)
 
 except Exception as e:
-last_scan_info["last_error"] = str(e)
-logging.warning(f"scan error: {e}")
+        last_scan_info["last_error"] = str(e)
+        logging.warning(f"scan error: {e}")
 
 finally:
-last_scan_info["hits"] = hits
-last_scan_info["ts"] = datetime.now(tz=timezone.utc)
-last_scan_info["duration_ms"] = int((time.perf_counter() - t0) * 1000)
-if hits:
-log.info(f"scan: pairs={last_scan_info['pairs']} hits={hits} duration={last_scan_info['duration_ms']}ms")
+        last_scan_info["hits"] = hits
+        last_scan_info["ts"] = datetime.now(tz=timezone.utc)
+        last_scan_info["duration_ms"] = int((time.perf_counter() - t0) * 1000)
+                if hits:
+                        log.info(f"scan: pairs={last_scan_info['pairs']} hits={hits} duration={last_scan_info['duration_ms']}ms")
 
 # ---------- TELEGRAM ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
