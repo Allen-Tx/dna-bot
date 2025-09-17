@@ -48,11 +48,11 @@ def _client():
         limits = httpx.Limits(max_connections=32, max_keepalive_connections=16)
         transport = httpx.AsyncHTTPTransport(retries=3)
 return httpx.AsyncClient(
-timeout=HTTP_TIMEOUT_SEC,
-headers={"Accept": "application/json"},
-limits=limits,
-transport=transport,
-)
+        timeout=HTTP_TIMEOUT_SEC,
+        headers={"Accept": "application/json"},
+        limits=limits,
+        transport=transport,
+        )
 
 DEX_SEARCH = "https://api.dexscreener.com/latest/dex/search?q=solana"
 TOKEN_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
