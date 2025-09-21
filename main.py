@@ -1,6 +1,7 @@
-
-# main.py — PTB v20.7 + Render + DexScreener fetcher
-import os, time, logging
+# main.py — PTB v20.7 + Render + DexScreener (Solana)
+import os
+import time
+import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List
 
@@ -22,7 +23,6 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "15"))        # seconds
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))  # seconds
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "8.0"))
-NEAR_MISS_WINDOW_SEC = int(os.getenv("NEAR_MISS_WINDOW_SEC", "60"))
 
 if not BOT_TOKEN or not CHAT_ID:
     log.error("Missing BOT_TOKEN or TELEGRAM_CHAT_ID.")
@@ -40,7 +40,6 @@ DNA: Dict[str, Any] = {
 
 # ---------- RUNTIME ----------
 last_alert_ts: Dict[str, datetime] = {}    # ca -> last alert time
-near_miss: Dict[str, Any] = {}
 last_scan_info: Dict[str, Any] = {
     "ts": None, "duration_ms": 0, "pairs": 0, "hits": 0, "last_error": None
 }
@@ -50,15 +49,19 @@ def now_utc_ms() -> int:
     return int(time.time() * 1000)
 
 def minutes_since_ms(ms: int) -> float:
-    if not ms: return 1e9
+    if not ms:
+        return 1e9
     return (now_utc_ms() - ms) / 60000.0
 
 def fmt_usd(x) -> str:
-    try: return f"${float(x):,.0f}"
-    except Exception: return str(x)
+    try:
+        return f"${float(x):,.0f}"
+    except Exception:
+        return str(x)
 
 # ---------- DATA FETCH (DexScreener) ----------
-DEX_API = "https://api.dexscreener.com/latest/dex/pairs/solana"
+# Use search endpoint & filter to Solana (prevents 404)
+DEX_API = "https://api.dexscreener.com/latest/dex/search?q=solana"
 
 async def fetch_pairs() -> List[Dict[str, Any]]:
     """
@@ -70,15 +73,15 @@ async def fetch_pairs() -> List[Dict[str, Any]]:
             r = await client.get(DEX_API)
             r.raise_for_status()
             data = r.json() or {}
-            pairs = data.get("pairs", []) or []
+            raw = data.get("pairs", []) or []
 
         cleaned: List[Dict[str, Any]] = []
-        for it in pairs:
+        for it in raw:
             if (it.get("chainId") or "").lower() != "solana":
                 continue
 
-            ca = (it.get("baseToken") or {}).get("address") \
-                 or it.get("pairAddress") or ""
+            base = (it.get("baseToken") or {})
+            ca = base.get("address") or it.get("pairAddress") or ""
             liq_usd = (it.get("liquidity") or {}).get("usd") or 0
             fdv = it.get("fdv") or 0
             vol_h1 = (it.get("volume") or {}).get("h1") or 0
@@ -209,6 +212,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, why = strict_dna_pass(p)
     await update.message.reply_text(fmt_verdict(p, ok, why))
 
+# job_queue task → runs on PTB's event loop (no event-loop issues)
 async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
     await scan_once(context.application)
 
@@ -221,11 +225,11 @@ def main():
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("check", cmd_check))
 
-    # run periodic scans on PTB's event loop
+    # periodic scanner
     app.job_queue.run_repeating(scanner_job, interval=SCAN_INTERVAL, first=0, name="scanner")
 
-    log.info("Bot started (STRICT DNA + live fetch).")
-    app.run_polling(drop_pending_updates=True)
+    log.info("Bot started (STRICT DNA + live Solana fetch).")
+    app.run_polling(drop_pending_updates=True)  # clears old updates, disables any webhook
 
 if __name__ == "__main__":
     main()
