@@ -1,26 +1,27 @@
-# main.py — PTB v20.7 + Render friendly
-# -------------------------------------
-import os, asyncio, logging, math, time
+# main.py — PTB v20.7 + Render friendly (no Updater, no APScheduler)
+import os, time, logging
 from datetime import datetime, timezone
+from typing import Dict, Any, List
+
 import httpx
-
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes
+)
 
-# --------- LOGGING ---------
+# ---------- LOGGING ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 log = logging.getLogger("strict-dna-bot")
 
-# --------- ENV -------------
+# ---------- ENV ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "15"))       # seconds
-ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "300")) # seconds
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "15"))        # seconds
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))  # seconds
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "8.0"))
 NEAR_MISS_WINDOW_SEC = int(os.getenv("NEAR_MISS_WINDOW_SEC", "60"))
 
@@ -28,20 +29,20 @@ if not BOT_TOKEN or not CHAT_ID:
     log.error("Missing BOT_TOKEN or TELEGRAM_CHAT_ID.")
     raise SystemExit(1)
 
-# --------- STRICT / ORIGINAL DNA (example values) ---------
-DNA = {
+# ---------- STRICT / ORIGINAL DNA (adjust as needed) ----------
+DNA: Dict[str, Any] = {
     "min_liq_usd": 35_000,     # Liquidity ≥ $35k
     "max_fdv_usd": 600_000,    # FDV ≤ $600k
     "max_age_min": 360,        # Age ≤ 6 hours
     "min_vol1h_usd": 50_000,   # 1h volume ≥ $50k
-    "min_m5_activity": 10,     # (buys+sells) over last 5m ≥ 10
+    "min_m5_activity": 10,     # (buys + sells) over last 5m ≥ 10
     "m5_change_tol": -2.0,     # allow m5 change down to -2%
 }
 
-# --------- RUNTIME STATE ----------
-last_alert_ts = {}      # ca -> datetime
-near_miss = {}          # ca -> (pair, first_seen_utc)
-last_scan_info = {      # telemetry
+# ---------- RUNTIME STATE ----------
+last_alert_ts: Dict[str, datetime] = {}    # ca -> last alert time (UTC)
+near_miss: Dict[str, Any] = {}             # reserved for future
+last_scan_info: Dict[str, Any] = {         # telemetry
     "ts": None,
     "duration_ms": 0,
     "pairs": 0,
@@ -49,7 +50,7 @@ last_scan_info = {      # telemetry
     "last_error": None,
 }
 
-# --------- HELPERS ----------
+# ---------- HELPERS ----------
 def now_utc_ms() -> int:
     return int(time.time() * 1000)
 
@@ -64,12 +65,13 @@ def fmt_usd(x) -> str:
     except Exception:
         return str(x)
 
-# --------- SCANNER STUBS ----------
-# Replace this with your real DexScreener call later
-async def fetch_pairs() -> list[dict]:
-    """Return a list of pair dicts with keys the DNA check expects.
-       This stub returns [] so the bot runs clean on Render."""
-    # Example of what a real item should contain (for your future use):
+# ---------- DATA FETCH (stub) ----------
+async def fetch_pairs() -> List[Dict[str, Any]]:
+    """
+    TODO: Replace this stub with your real DexScreener call.
+    Return a list of pair dicts with keys used by the DNA check.
+    """
+    # Example shape for later:
     # return [{
     #   "ca": "So1anaContractAddr",
     #   "liquidity": {"usd": 40000},
@@ -81,8 +83,8 @@ async def fetch_pairs() -> list[dict]:
     # }]
     return []
 
-def strict_dna_pass(p: dict) -> tuple[bool, str]:
-    """Return (pass, reason). Adjust to your exact rules."""
+# ---------- DNA CHECK ----------
+def strict_dna_pass(p: Dict[str, Any]) -> (bool, str):
     liq = (p.get("liquidity") or {}).get("usd", 0) or 0
     fdv = p.get("fdv", 0) or 0
     vol1h = (p.get("volume") or {}).get("h1", 0) or 0
@@ -107,7 +109,7 @@ def strict_dna_pass(p: dict) -> tuple[bool, str]:
         return False, f"m5 Δ {m5}%<{DNA['m5_change_tol']}%"
     return True, "OK"
 
-def fmt_verdict(p: dict, ok: bool, why: str) -> str:
+def fmt_verdict(p: Dict[str, Any], ok: bool, why: str) -> str:
     liq = (p.get("liquidity") or {}).get("usd", 0) or 0
     fdv = p.get("fdv", 0) or 0
     vol1h = (p.get("volume") or {}).get("h1", 0) or 0
@@ -125,39 +127,9 @@ def fmt_verdict(p: dict, ok: bool, why: str) -> str:
         f"m5 Δ {m5:.1f}% | m5 activity {activity5} | age {age_min:.0f}m"
     )
 
-# --------- COMMAND HANDLERS ---------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("DNA bot is online 🔬  Try /status or /scan")
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    info = last_scan_info.copy()
-    ts = info["ts"]
-    when = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "never"
-    msg = (
-        f"Last scan: {when}\n"
-        f"Duration: {info['duration_ms']} ms\n"
-        f"Pairs: {info['pairs']} | Hits: {info['hits']}\n"
-        f"Last error: {info['last_error']}"
-    )
-    await update.message.reply_text(msg)
-
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await scan_once(context.application)
-    await update.message.reply_text("Scan complete.")
-
-async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Quick “check one pair” demo from a fake list (no external call here)
-    pairs = await fetch_pairs()
-    if not pairs:
-        await update.message.reply_text("No data.")
-        return
-    p = pairs[0]
-    ok, why = strict_dna_pass(p)
-    await update.message.reply_text(fmt_verdict(p, ok, why))
-
-# --------- SCAN LOOP ----------
+# ---------- SCAN LOOP ----------
 async def scan_once(app: Application):
-    """One scanner cycle: fetch pairs, run DNA, send alerts to CHAT_ID."""
+    """One scanner cycle: fetch pairs, run DNA, send alerts."""
     t0 = time.time()
     hits = 0
     try:
@@ -166,17 +138,14 @@ async def scan_once(app: Application):
             ok, why = strict_dna_pass(p)
             if ok:
                 hits += 1
-                # throttle alerts per contract address (optional)
                 ca = p.get("ca") or "unknown"
                 last = last_alert_ts.get(ca)
                 if last and (datetime.now(timezone.utc) - last).total_seconds() < ALERT_COOLDOWN_SEC:
                     continue
                 last_alert_ts[ca] = datetime.now(timezone.utc)
 
-                await app.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=fmt_verdict(p, ok, why)
-                )
+                await app.bot.send_message(chat_id=CHAT_ID, text=fmt_verdict(p, ok, why))
+
         last_scan_info.update({
             "ts": datetime.now(timezone.utc),
             "duration_ms": int((time.time() - t0) * 1000),
@@ -192,24 +161,60 @@ async def scan_once(app: Application):
             "last_error": repr(e),
         })
 
-# --------- MAIN ----------
+# ---------- COMMANDS ----------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("DNA bot is online 🔬  Try /status or /scan")
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    info = last_scan_info.copy()
+    ts = info["ts"]
+    when = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "never"
+    msg = (
+        f"Last scan: {when}\n"
+        f"Duration: {info['duration_ms']} ms\n"
+        f"Pairs: {info.get('pairs', 0)} | Hits: {info.get('hits', 0)}\n"
+        f"Last error: {info.get('last_error')}"
+    )
+    await update.message.reply_text(msg)
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await scan_once(context.application)
+    await update.message.reply_text("Scan complete.")
+
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pairs = await fetch_pairs()
+    if not pairs:
+        await update.message.reply_text("No data.")
+        return
+    p = pairs[0]
+    ok, why = strict_dna_pass(p)
+    await update.message.reply_text(fmt_verdict(p, ok, why))
+
+# job_queue callback (runs on the bot's event loop)
+async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
+    await scan_once(context.application)
+
+# ---------- MAIN ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # register handlers
+    # handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("check", cmd_check))
 
-    # scheduler: run scan periodically
-    sched = AsyncIOScheduler(job_defaults={"coalesce": True, "max_instances": 1})
-    sched.add_job(lambda: asyncio.create_task(scan_once(app)),
-                  "interval", seconds=SCAN_INTERVAL, id="scanner")
-    sched.start()
+    # periodic scan using PTB job_queue (no external scheduler needed)
+    app.job_queue.run_repeating(
+        scanner_job,
+        interval=SCAN_INTERVAL,
+        first=0,
+        name="scanner",
+    )
 
     log.info("Bot started (STRICT DNA + delivery hardened).")
-    app.run_polling()  # <-- correct for PTB v20.7 (no Updater anywhere)
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
+
