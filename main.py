@@ -1,13 +1,12 @@
-# main.py — PTB v20.7 + Render friendly (no Updater, no APScheduler)
+
+# main.py — PTB v20.7 + Render + DexScreener fetcher
 import os, time, logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List
 
 import httpx
 from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ---------- LOGGING ----------
 logging.basicConfig(
@@ -29,7 +28,7 @@ if not BOT_TOKEN or not CHAT_ID:
     log.error("Missing BOT_TOKEN or TELEGRAM_CHAT_ID.")
     raise SystemExit(1)
 
-# ---------- STRICT / ORIGINAL DNA (adjust as needed) ----------
+# ---------- DNA (tweak anytime) ----------
 DNA: Dict[str, Any] = {
     "min_liq_usd": 35_000,     # Liquidity ≥ $35k
     "max_fdv_usd": 600_000,    # FDV ≤ $600k
@@ -39,15 +38,11 @@ DNA: Dict[str, Any] = {
     "m5_change_tol": -2.0,     # allow m5 change down to -2%
 }
 
-# ---------- RUNTIME STATE ----------
-last_alert_ts: Dict[str, datetime] = {}    # ca -> last alert time (UTC)
-near_miss: Dict[str, Any] = {}             # reserved for future
-last_scan_info: Dict[str, Any] = {         # telemetry
-    "ts": None,
-    "duration_ms": 0,
-    "pairs": 0,
-    "hits": 0,
-    "last_error": None,
+# ---------- RUNTIME ----------
+last_alert_ts: Dict[str, datetime] = {}    # ca -> last alert time
+near_miss: Dict[str, Any] = {}
+last_scan_info: Dict[str, Any] = {
+    "ts": None, "duration_ms": 0, "pairs": 0, "hits": 0, "last_error": None
 }
 
 # ---------- HELPERS ----------
@@ -55,33 +50,59 @@ def now_utc_ms() -> int:
     return int(time.time() * 1000)
 
 def minutes_since_ms(ms: int) -> float:
-    if not ms:
-        return 1e9
+    if not ms: return 1e9
     return (now_utc_ms() - ms) / 60000.0
 
 def fmt_usd(x) -> str:
-    try:
-        return f"${float(x):,.0f}"
-    except Exception:
-        return str(x)
+    try: return f"${float(x):,.0f}"
+    except Exception: return str(x)
 
-# ---------- DATA FETCH (stub) ----------
+# ---------- DATA FETCH (DexScreener) ----------
+DEX_API = "https://api.dexscreener.com/latest/dex/pairs/solana"
+
 async def fetch_pairs() -> List[Dict[str, Any]]:
     """
-    TODO: Replace this stub with your real DexScreener call.
-    Return a list of pair dicts with keys used by the DNA check.
+    Fetch recent Solana pairs from DexScreener and map to the fields
+    our DNA checks expect.
     """
-    # Example shape for later:
-    # return [{
-    #   "ca": "So1anaContractAddr",
-    #   "liquidity": {"usd": 40000},
-    #   "fdv": 580000,
-    #   "volume": {"h1": 52000},
-    #   "priceChange": {"m5": -1.3},
-    #   "txns": {"m5": {"buys": 6, "sells": 6}},
-    #   "pairCreatedAt": now_utc_ms() - 45*60*1000,
-    # }]
-    return []
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC) as client:
+            r = await client.get(DEX_API)
+            r.raise_for_status()
+            data = r.json() or {}
+            pairs = data.get("pairs", []) or []
+
+        cleaned: List[Dict[str, Any]] = []
+        for it in pairs:
+            if (it.get("chainId") or "").lower() != "solana":
+                continue
+
+            ca = (it.get("baseToken") or {}).get("address") \
+                 or it.get("pairAddress") or ""
+            liq_usd = (it.get("liquidity") or {}).get("usd") or 0
+            fdv = it.get("fdv") or 0
+            vol_h1 = (it.get("volume") or {}).get("h1") or 0
+            pc_m5 = (it.get("priceChange") or {}).get("m5") or 0
+            tx_m5 = (it.get("txns") or {}).get("m5") or {}
+            buys = tx_m5.get("buys") or 0
+            sells = tx_m5.get("sells") or 0
+            created_ms = it.get("pairCreatedAt") or now_utc_ms()
+
+            cleaned.append({
+                "ca": ca,
+                "liquidity": {"usd": liq_usd},
+                "fdv": fdv,
+                "volume": {"h1": vol_h1},
+                "priceChange": {"m5": pc_m5},
+                "txns": {"m5": {"buys": buys, "sells": sells}},
+                "pairCreatedAt": created_ms,
+            })
+
+        cleaned.sort(key=lambda x: x.get("pairCreatedAt", 0), reverse=True)
+        return cleaned[:100]  # cap to avoid spam
+    except Exception:
+        log.exception("fetch_pairs error")
+        return []
 
 # ---------- DNA CHECK ----------
 def strict_dna_pass(p: Dict[str, Any]) -> (bool, str):
@@ -127,9 +148,8 @@ def fmt_verdict(p: Dict[str, Any], ok: bool, why: str) -> str:
         f"m5 Δ {m5:.1f}% | m5 activity {activity5} | age {age_min:.0f}m"
     )
 
-# ---------- SCAN LOOP ----------
+# ---------- SCAN ----------
 async def scan_once(app: Application):
-    """One scanner cycle: fetch pairs, run DNA, send alerts."""
     t0 = time.time()
     hits = 0
     try:
@@ -143,7 +163,6 @@ async def scan_once(app: Application):
                 if last and (datetime.now(timezone.utc) - last).total_seconds() < ALERT_COOLDOWN_SEC:
                     continue
                 last_alert_ts[ca] = datetime.now(timezone.utc)
-
                 await app.bot.send_message(chat_id=CHAT_ID, text=fmt_verdict(p, ok, why))
 
         last_scan_info.update({
@@ -190,7 +209,6 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, why = strict_dna_pass(p)
     await update.message.reply_text(fmt_verdict(p, ok, why))
 
-# job_queue callback (runs on the bot's event loop)
 async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
     await scan_once(context.application)
 
@@ -198,23 +216,16 @@ async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("check", cmd_check))
 
-    # periodic scan using PTB job_queue (no external scheduler needed)
-    app.job_queue.run_repeating(
-        scanner_job,
-        interval=SCAN_INTERVAL,
-        first=0,
-        name="scanner",
-    )
+    # run periodic scans on PTB's event loop
+    app.job_queue.run_repeating(scanner_job, interval=SCAN_INTERVAL, first=0, name="scanner")
 
-    log.info("Bot started (STRICT DNA + delivery hardened).")
-    app.run_polling()
+    log.info("Bot started (STRICT DNA + live fetch).")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-
