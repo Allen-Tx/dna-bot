@@ -1,11 +1,14 @@
-# main.py — PTB v20.7 + Render + DexScreener (Solana)
+# main.py — PTB v20.7 + Render + DexScreener (Solana) + Backoff
 import os
 import time
+import asyncio
+import random
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import httpx
+from httpx import HTTPStatusError
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -20,9 +23,13 @@ log = logging.getLogger("strict-dna-bot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "15"))        # seconds
-ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))  # seconds
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "30"))            # how often job_queue runs
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))     # per-CA alert throttle
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "8.0"))
+
+# local rate-limit knobs for DexScreener
+MIN_FETCH_GAP_SEC = int(os.getenv("MIN_FETCH_GAP_SEC", "25"))        # minimum gap between API calls
+BACKOFF_SEC = int(os.getenv("BACKOFF_SEC", "60"))                    # sleep after a 429
 
 if not BOT_TOKEN or not CHAT_ID:
     log.error("Missing BOT_TOKEN or TELEGRAM_CHAT_ID.")
@@ -44,6 +51,10 @@ last_scan_info: Dict[str, Any] = {
     "ts": None, "duration_ms": 0, "pairs": 0, "hits": 0, "last_error": None
 }
 
+# in-process API throttling state
+_last_fetch_ts: float = 0.0
+_next_allowed_fetch_ts: float = 0.0
+
 # ---------- HELPERS ----------
 def now_utc_ms() -> int:
     return int(time.time() * 1000)
@@ -60,20 +71,39 @@ def fmt_usd(x) -> str:
         return str(x)
 
 # ---------- DATA FETCH (DexScreener) ----------
-# Use search endpoint & filter to Solana (prevents 404)
+# Use search endpoint & filter to Solana
 DEX_API = "https://api.dexscreener.com/latest/dex/search?q=solana"
 
 async def fetch_pairs() -> List[Dict[str, Any]]:
     """
     Fetch recent Solana pairs from DexScreener and map to the fields
-    our DNA checks expect.
+    our DNA checks expect. Includes simple local rate limiting and
+    429 backoff handling.
     """
+    global _last_fetch_ts, _next_allowed_fetch_ts
+
+    now = time.time()
+
+    # respect any active backoff window
+    if now < _next_allowed_fetch_ts:
+        log.info("Respecting backoff window (%.1fs left), skipping fetch.", _next_allowed_fetch_ts - now)
+        return []
+
+    # ensure a minimum gap between calls (+ small jitter)
+    gap = now - _last_fetch_ts
+    min_gap = MIN_FETCH_GAP_SEC + random.uniform(0, 3)
+    if gap < min_gap:
+        await asyncio.sleep(min_gap - gap)
+
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC) as client:
+        headers = {"User-Agent": "dna-bot/1.0 (contact: telegram)"}
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC, headers=headers) as client:
             r = await client.get(DEX_API)
             r.raise_for_status()
             data = r.json() or {}
             raw = data.get("pairs", []) or []
+
+        _last_fetch_ts = time.time()
 
         cleaned: List[Dict[str, Any]] = []
         for it in raw:
@@ -103,12 +133,20 @@ async def fetch_pairs() -> List[Dict[str, Any]]:
 
         cleaned.sort(key=lambda x: x.get("pairCreatedAt", 0), reverse=True)
         return cleaned[:100]  # cap to avoid spam
+
+    except HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 429:
+            log.warning("DexScreener rate limit (429). Backing off for %ss", BACKOFF_SEC)
+            _next_allowed_fetch_ts = time.time() + BACKOFF_SEC
+            return []
+        log.exception("fetch_pairs HTTP error")
+        return []
     except Exception:
         log.exception("fetch_pairs error")
         return []
 
 # ---------- DNA CHECK ----------
-def strict_dna_pass(p: Dict[str, Any]) -> (bool, str):
+def strict_dna_pass(p: Dict[str, Any]) -> Tuple[bool, str]:
     liq = (p.get("liquidity") or {}).get("usd", 0) or 0
     fdv = p.get("fdv", 0) or 0
     vol1h = (p.get("volume") or {}).get("h1", 0) or 0
@@ -212,7 +250,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, why = strict_dna_pass(p)
     await update.message.reply_text(fmt_verdict(p, ok, why))
 
-# job_queue task → runs on PTB's event loop (no event-loop issues)
+# job_queue task
 async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
     await scan_once(context.application)
 
@@ -228,8 +266,8 @@ def main():
     # periodic scanner
     app.job_queue.run_repeating(scanner_job, interval=SCAN_INTERVAL, first=0, name="scanner")
 
-    log.info("Bot started (STRICT DNA + live Solana fetch).")
-    app.run_polling(drop_pending_updates=True)  # clears old updates, disables any webhook
+    log.info("Bot started (STRICT DNA + Solana fetch + backoff).")
+    app.run_polling(drop_pending_updates=True)  # clears old updates / disables webhook
 
 if __name__ == "__main__":
     main()
