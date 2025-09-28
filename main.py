@@ -2,18 +2,17 @@
 import asyncio
 import logging
 import os
-import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
-from aiohttp import ClientSession, ClientTimeout, web
+import httpx
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
+    JobQueue,
 )
 
 # -----------------
@@ -26,41 +25,24 @@ logging.basicConfig(
 log = logging.getLogger("memecoin-dna-bot")
 
 # -----------------
-# Config from env
+# Config
 # -----------------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var.")
 
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()  # can be user id or group/channel id
 DISCOVERY_INTERVAL = int(os.environ.get("DISCOVERY_INTERVAL_SECONDS", "60"))
 HEALTH_PORT = int(os.environ.get("PORT", "10000"))
-NETWORK = os.environ.get("NETWORK", "solana").lower().strip() or "solana"
-DNA_MODE = os.environ.get("DNA_MODE", "tytty").lower().strip()  # winner|tytty|strict
-
-# WATCHLIST can contain token mints, search words, or full dexscreener URLs
-WATCHLIST = [w.strip() for w in os.environ.get("WATCHLIST", "").split(",") if w.strip()]
-
-DEX_API = "https://api.dexscreener.com/latest/dex"
 
 # -----------------
-# DNA thresholds
+# DNA thresholds (from your PDF)
 # -----------------
-def dna_thresholds(mode: str) -> Tuple[int, int]:
-    """
-    Returns (fdv_usd_max, lp_min_usd) by mode.
-    winner: FDV < 250k, LP >= 15k
-    tytty:  FDV < 600k, LP >= 20-30k (we'll use 20k min, you can raise to 30k)
-    strict: FDV < 500k, LP >= 30k + stronger social/lock checks (best-effort here)
-    """
-    mode = (mode or "tytty").lower()
-    if mode == "winner":
-        return (250_000, 15_000)
-    if mode == "strict":
-        return (500_000, 30_000)
-    # default tytty
-    return (600_000, 20_000)
-
-FDV_MAX, LP_MIN = dna_thresholds(DNA_MODE)
+DNA_RULES = {
+    "Winner":   {"max_fdv": 250_000, "min_lp": 15_000, "extra": {}},        # early + low LP ok
+    "Tytty":    {"max_fdv": 600_000, "min_lp": 20_000, "extra": {}},        # balanced
+    "Strict":   {"max_fdv": 500_000, "min_lp": 30_000, "extra": {"lock": True}},  # safest
+}
 
 # -----------------
 # Health server
@@ -79,233 +61,201 @@ async def start_health_server(port: int) -> web.AppRunner:
     return runner
 
 # -----------------
-# DexScreener client
+# Telegram helpers
 # -----------------
-async def ds_search(session: ClientSession, query: str) -> List[dict]:
+async def send_text(app: Application, text: str, parse_mode: Optional[str] = "HTML") -> None:
+    if not CHAT_ID:
+        log.warning("TELEGRAM_CHAT_ID not set; skipping send.")
+        return
+    try:
+        await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=parse_mode, disable_web_page_preview=False)
+    except Exception as e:
+        log.exception("send_text error: %s", e)
+
+# -----------------
+# DexScreener fetch
+# -----------------
+DEX_BASE = "https://api.dexscreener.com"
+
+async def fetch_latest_solana_pairs(client: httpx.AsyncClient, limit: int = 50) -> List[Dict[str, Any]]:
     """
-    Accepts: token mint, pair URL, or search text.
-    Returns: list of pair dicts (might be empty).
+    Pull latest Solana pairs. DexScreener endpoint returns many; we'll cap locally.
     """
-    # Accept direct pair URL
-    m = re.search(r"dexscreener\.com/([a-zA-Z0-9_-]+)/([A-Za-z0-9]+)", query)
-    if m:
-        chain, pair = m.group(1), m.group(2)
-        url = f"{DEX_API}/pairs/{chain}/{pair}"
-        async with session.get(url, timeout=ClientTimeout(total=10)) as r:
-            data = await r.json()
-            return data.get("pairs", []) or []
+    # Endpoint commonly used: /latest/dex/pairs/{chainId}
+    url = f"{DEX_BASE}/latest/dex/pairs/solana"
+    r = await client.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    pairs = data.get("pairs", [])[:limit]
+    return pairs
 
-    # Accept token address lookup
-    token_like = re.fullmatch(r"[A-Za-z0-9]{25,64}", query)
-    if token_like:
-        url = f"{DEX_API}/tokens/{query}"
-        async with session.get(url, timeout=ClientTimeout(total=10)) as r:
-            data = await r.json()
-            return data.get("pairs", []) or []
-
-    # Generic search
-    url = f"{DEX_API}/search?q={query}"
-    async with session.get(url, timeout=ClientTimeout(total=10)) as r:
-        data = await r.json()
-        return data.get("pairs", []) or []
-
-def extract_pair_fields(p: dict) -> dict:
-    # Defensive parsing; DexScreener fields can be missing
-    liq_usd = 0
-    if p.get("liquidity", {}).get("usd") is not None:
-        liq_usd = float(p["liquidity"]["usd"])
-    fdv = p.get("fdv")
-    if fdv is None and p.get("fullyDilutedValuation") is not None:
-        fdv = p["fullyDilutedValuation"]
-    if fdv is None:
-        fdv = 0
-    base = p.get("baseToken", {})
-    quote = p.get("quoteToken", {})
-    tx = p.get("txns", {})
-    buys = tx.get("m5", {}).get("buys", 0)
-    sells = tx.get("m5", {}).get("sells", 0)
-    price = p.get("priceUsd") or p.get("price") or "?"
-    url = p.get("url") or p.get("pairUrl")
-    chain = p.get("chainId") or p.get("chain")
-    pair_addr = p.get("pairAddress") or p.get("pairCreatedAt")
-    mcap = p.get("marketCap") or 0  # sometimes provided
-    change_m5 = p.get("priceChange", {}).get("m5", 0)
-    return {
-        "symbol": base.get("symbol") or "?",
-        "name": base.get("name") or "?",
-        "base": base.get("address") or "?",
-        "quote": quote.get("symbol") or "?",
-        "chain": chain or "?",
-        "pair": pair_addr or "?",
-        "price": price,
-        "lp_usd": float(liq_usd or 0),
-        "fdv": float(fdv or 0),
-        "mcap": float(mcap or 0),
-        "buys5": int(buys or 0),
-        "sells5": int(sells or 0),
-        "chg5": float(change_m5 or 0),
-        "url": url or "",
-    }
-
-def passes_basic_safety(x: dict) -> Tuple[bool, List[str]]:
+# -----------------
+# Rug / safety checks (basic placeholders)
+# -----------------
+def basic_rug_checks(p: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """
-    Lightweight checks that help avoid obvious rugs:
-    - LP >= LP_MIN
-    - FDV within cap
-    - Not zero buys & only sells in last 5m
-    - Not absurdly thin LP (< 10k) even if DNA says 15k (guard rail)
+    Super lightweight checks that are free and fast:
+    - not paused (DexScreener won't show paused trades anyway)
+    - some tx activity in 5m/1h windows
+    - non-zero liquidity and price
+    - optional: check for LP lock flag if provided by API (rare)
+    Returns (ok, reasons_failed)
     """
     reasons = []
-    ok = True
-    if x["lp_usd"] < LP_MIN:
-        ok = False
-        reasons.append(f"LP too low (${x['lp_usd']:.0f} < ${LP_MIN:,})")
-    if x["fdv"] <= 0 or x["fdv"] > FDV_MAX:
-        ok = False
-        reasons.append(f"FDV out of range (${x['fdv']:.0f} > ${FDV_MAX:,})")
-    if x["buys5"] == 0 and x["sells5"] > 0:
-        ok = False
-        reasons.append("Only sells in last 5m")
-    if x["lp_usd"] < 10_000:
-        ok = False
-        reasons.append("LP under $10k (extra guard rail)")
-    return ok, reasons
 
-def dna_name() -> str:
-    return {"winner": "Winner", "strict": "Strict"}.get(DNA_MODE, "Tytty")
+    liq = (p.get("liquidity") or {})
+    lp_usd = float(liq.get("usd") or 0)
 
-def fmt_pair(x: dict) -> str:
-    return (
-        f"{x['symbol']} ({x['chain']})\n"
-        f"Price: ${x['price']} | LP: ${x['lp_usd']:.0f} | FDV: ${x['fdv']:.0f}\n"
-        f"5m Buys/Sells: {x['buys5']}/{x['sells5']} | Δ5m: {x['chg5']}%\n"
-        f"{x['url']}"
-    )
+    # txns structure: {'m5': {'buys': x, 'sells': y}, 'h1': {...}}
+    tx = (p.get("txns") or {})
+    m5 = tx.get("m5") or {}
+    h1 = tx.get("h1") or {}
+    m5_buys = int(m5.get("buys") or 0)
+    m5_sells = int(m5.get("sells") or 0)
+    h1_buys = int(h1.get("buys") or 0)
+    h1_sells = int(h1.get("sells") or 0)
+
+    price_usd = float((p.get("priceUsd") or 0) or 0)
+
+    if lp_usd <= 0:
+        reasons.append("no_liquidity")
+    if price_usd <= 0:
+        reasons.append("no_price")
+    if (m5_buys + m5_sells + h1_buys + h1_sells) == 0:
+        reasons.append("no_tx_activity")
+
+    # Some sources add lock flags; if present, keep it
+    is_locked = bool(p.get("liquidity") and p["liquidity"].get("isLocked"))
+    return (len(reasons) == 0, reasons)
 
 # -----------------
-# Telegram Handlers
+# DNA classification
+# -----------------
+def classify_dna(p: Dict[str, Any]) -> Optional[str]:
+    """
+    Return 'Winner' / 'Tytty' / 'Strict' if pair fits any DNA; else None.
+    """
+    fdv = float(p.get("fdv") or 0)
+    lp_usd = float((p.get("liquidity") or {}).get("usd") or 0)
+
+    # LP lock flag if API provides it (not always available)
+    is_locked = bool((p.get("liquidity") or {}).get("isLocked"))
+
+    # Strict requires lp locked (if field exists). If field is missing, we skip the lock requirement.
+    def passes(rule: Dict[str, Any]) -> bool:
+        if fdv <= rule["max_fdv"] and lp_usd >= rule["min_lp"]:
+            if rule["extra"].get("lock"):
+                # only enforce if API exposes the flag
+                if "isLocked" in (p.get("liquidity") or {}):
+                    return is_locked
+            return True
+        return False
+
+    if passes(DNA_RULES["Winner"]):
+        return "Winner"
+    if passes(DNA_RULES["Tytty"]):
+        return "Tytty"
+    if passes(DNA_RULES["Strict"]):
+        return "Strict"
+    return None
+
+# -----------------
+# Format alert
+# -----------------
+def pair_link(p: Dict[str, Any]) -> str:
+    # Prefer pair link if present, else build with chain + pairAddress
+    url = p.get("url")
+    if url:
+        return url
+    chain = p.get("chainId", "solana")
+    pair_addr = p.get("pairAddress") or p.get("pair") or ""
+    return f"https://dexscreener.com/{chain}/{pair_addr}"
+
+def format_alert(dna: str, p: Dict[str, Any]) -> str:
+    name = p.get("baseToken", {}).get("name") or p.get("baseToken", {}).get("symbol") or "Unknown"
+    symbol = p.get("baseToken", {}).get("symbol") or "?"
+    fdv = float(p.get("fdv") or 0)
+    lp = float((p.get("liquidity") or {}).get("usd") or 0)
+    mcap = fdv  # DexScreener fdv often acts like mcap for new tokens
+    tx = (p.get("txns") or {})
+    m5 = tx.get("m5") or {}
+    h1 = tx.get("h1") or {}
+
+    link = pair_link(p)
+    notes = {
+        "Winner": "High risk / high reward (super early).",
+        "Tytty": "Balanced early entry.",
+        "Strict": "Safer (LP ≥30k; lock if available).",
+    }.get(dna, "")
+
+    msg = (
+        f"<b>{dna} DNA</b> — <b>{symbol}</b> ({name})\n"
+        f"FDV: <b>${mcap:,.0f}</b> | LP: <b>${lp:,.0f}</b>\n"
+        f"5m buys/sells: {m5.get('buys',0)}/{m5.get('sells',0)} | "
+        f"1h buys/sells: {h1.get('buys',0)}/{h1.get('sells',0)}\n"
+        f"{notes}\n"
+        f"{link}"
+    )
+    return msg
+
+# -----------------
+# Commands
 # -----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    subs = context.application.bot_data.setdefault("subs", set())
-    subs.add(chat_id)
     await update.message.reply_text(
-        f"Yo! Subscribed.\n"
-        f"DNA mode: {dna_name()} (FDV<{FDV_MAX:,}, LP>={LP_MIN:,}).\n"
-        f"Use /check <addr|url|word> to scan manually. Use /stop to unsubscribe."
+        "Yo! Bot is live.\n"
+        "I scan new Solana pairs and alert on Winner / Tytty / Strict DNA.\n"
+        "Use /ping to test alerts."
     )
-
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    subs = context.application.bot_data.setdefault("subs", set())
-    subs.discard(chat_id)
-    await update.message.reply_text("Unsubscribed. /start to subscribe again.")
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong")
 
-async def dna_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        f"{dna_name()} DNA:\n"
-        f"- FDV < ${FDV_MAX:,}\n"
-        f"- LP >= ${LP_MIN:,}\n"
-        f"- Basic safety: no 0-buys/only-sells in last 5m, LP not ultra-thin\n"
-        f"Change by env with DNA_MODE=winner|tytty|strict"
-    )
-
-async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /check <addr|dexscreener url|search term>")
-        return
-    query = " ".join(context.args).strip()
-    session: ClientSession = context.application.bot_data["http"]
-    try:
-        pairs = await ds_search(session, query)
-        if not pairs:
-            await update.message.reply_text("No pairs found.")
-            return
-        # Prefer current network first
-        ranked = sorted(
-            (extract_pair_fields(p) for p in pairs),
-            key=lambda z: (z["chain"] != NETWORK, -z["lp_usd"]),
-        )
-        lines = []
-        shown = 0
-        for x in ranked:
-            ok, reasons = passes_basic_safety(x)
-            tag = "✅ PASS" if ok else f"❌ FAIL ({'; '.join(reasons)})"
-            lines.append(f"{tag}\n{fmt_pair(x)}")
-            shown += 1
-            if shown >= 5:
-                break
-        await update.message.reply_text("\n\n".join(lines))
-    except Exception as e:
-        log.exception("/check error: %s", e)
-        await update.message.reply_text("Error while checking. Try another query.")
-
-# Optional text fallback: quick /check on pasted URL or address
-async def plain_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-    # Auto-check if message looks like a URL or token
-    if "dexscreener.com" in text or re.fullmatch(r"[A-Za-z0-9]{25,64}", text):
-        update.message.text = f"/check {text}"
-        await check_cmd(update, context)
-
 # -----------------
-# Discovery job
+# Discovery loop
 # -----------------
 async def discovery_cycle(app: Application) -> None:
+    """
+    1) Pull latest Solana pairs from DexScreener.
+    2) Run basic rug/sanity checks.
+    3) Classify DNA by FDV/LP thresholds.
+    4) De-dupe so we don't spam same pair repeatedly.
+    5) Send Telegram alerts.
+    """
     try:
-        session: ClientSession = app.bot_data["http"]
-        subs = app.bot_data.setdefault("subs", set())
-        if not subs:
-            return  # nobody to notify yet
+        # keep a simple seen cache in memory (resets on deploy)
+        seen: set = app.bot_data.setdefault("seen_pairs", set())
 
-        queries = WATCHLIST or []
-        if not queries:
-            return
+        async with httpx.AsyncClient(timeout=15) as client:
+            pairs = await fetch_latest_solana_pairs(client, limit=80)
 
-        # simple de-dup throttle: don't repeat same pair within 30 min
-        seen: Dict[str, float] = app.bot_data.setdefault("seen_pairs", {})
+        new_alerts = 0
+        for p in pairs:
+            pair_addr = p.get("pairAddress") or p.get("pair") or ""
+            if not pair_addr:
+                continue
 
-        results: List[str] = []
-        for q in queries:
-            pairs = await ds_search(session, q)
-            for p in pairs:
-                x = extract_pair_fields(p)
-                # Focus current chain
-                if (x["chain"] or "").lower() != NETWORK:
-                    continue
-                ok, reasons = passes_basic_safety(x)
-                if not ok:
-                    continue
-                key = x["url"] or f"{x['chain']}/{x['pair']}"
-                # throttle
-                if key in seen:
-                    continue
-                # Mark as seen for 30 minutes
-                seen[key] = asyncio.get_event_loop().time() + 1800
-                results.append(
-                    f"🔥 {dna_name()} match\n{fmt_pair(x)}"
-                )
+            # Skip if we already alerted this pair+DNA once
+            dna = classify_dna(p)
+            if not dna:
+                continue
 
-        # purge expired seen
-        now = asyncio.get_event_loop().time()
-        for k, exp in list(seen.items()):
-            if exp <= now:
-                seen.pop(k, None)
+            key = f"{dna}:{pair_addr}"
+            if key in seen:
+                continue
 
-        if not results:
-            return
+            ok, reasons = basic_rug_checks(p)
+            if not ok:
+                # Skip very obvious bad ones, but we don't mark as seen
+                continue
 
-        text = "\n\n".join(results[:8])  # avoid spamming
-        for chat_id in list(subs):
-            try:
-                await app.bot.send_message(chat_id=chat_id, text=text)
-            except Exception as e:
-                log.warning("notify failed to %s: %s", chat_id, e)
+            # Mark as seen and alert
+            seen.add(key)
+            msg = format_alert(dna, p)
+            await send_text(app, msg)
+            new_alerts += 1
+
+        log.info("discovery_cycle tick — %d alerts", new_alerts)
 
     except Exception as e:
         log.exception("discovery_cycle error: %s", e)
@@ -317,61 +267,49 @@ async def discovery_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # Lifecycle
 # -----------------
 async def on_post_init(app: Application) -> None:
-    # HTTP client
-    session = ClientSession(timeout=ClientTimeout(total=12))
-    app.bot_data["http"] = session
-
-    # Health server
+    # Start health server
     runner = await start_health_server(HEALTH_PORT)
     app.bot_data["health_runner"] = runner
 
-    # Schedule discovery
+    # Schedule discovery job
     jq = app.job_queue
     if jq is None:
         log.error("JobQueue is None. Skipping schedule.")
-    else:
-        jq.run_repeating(
-            discovery_job,
-            interval=DISCOVERY_INTERVAL,
-            first=5,
-            name="discovery_cycle",
-        )
-        log.info(
-            "Scheduled discovery job every %ss | DNA=%s FDV<%s LP>=%s | NETWORK=%s",
-            DISCOVERY_INTERVAL, dna_name(), FDV_MAX, LP_MIN, NETWORK
-        )
+        return
 
-async def on_shutdown(app: Application) -> None:
-    # Close HTTP + health runner
-    session: ClientSession = app.bot_data.get("http")
-    if session:
-        await session.close()
-    runner: web.AppRunner = app.bot_data.get("health_runner")
-    if runner:
-        await runner.cleanup()
+    jq.run_repeating(
+        discovery_job,
+        interval=DISCOVERY_INTERVAL,
+        first=5,
+        name="discovery_cycle",
+    )
+    log.info("Scheduled discovery job every %ss", DISCOVERY_INTERVAL)
 
+# -----------------
+# Build & run
+# -----------------
 def build_app() -> Application:
+    jq = JobQueue()
     app: Application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .post_init(on_post_init)
-        .post_shutdown(on_shutdown)
+        .job_queue(jq)            # force JobQueue (prevents None)
+        .post_init(on_post_init)  # start health + schedule jobs
+        .concurrent_updates(True)
         .build()
     )
 
-    # Handlers
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
-    app.add_handler(CommandHandler("dna", dna_cmd))
-    app.add_handler(CommandHandler("check", check_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text_handler))
-
     return app
 
 def main() -> None:
     app = build_app()
-    app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None, close_loop=False)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        stop_signals=None,
+        close_loop=False,
+    )
 
 if __name__ == "__main__":
     main()
