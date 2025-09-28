@@ -1,3 +1,4 @@
 python-telegram-bot==20.7
 httpx==0.25.2
-APScheduler==3.10.4
+aiohttp==3.9.5
+
