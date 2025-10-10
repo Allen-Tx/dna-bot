@@ -1,257 +1,338 @@
 # main.py
-import asyncio
-import logging
 import os
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any
+import asyncio
+import json
+import time
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
 
 import httpx
-from aiohttp import web
-from telegram import Update
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    JobQueue,
-)
 
-# -----------------
-# Logging
-# -----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("memecoin-dna-bot")
+# ========= ENV =========
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# -----------------
-# Config
-# -----------------
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var.")
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()  # required for liq/price lane
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()    # optional safety lane
 
-CHAT_ID_ENV = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_CHAT_ID = int(CHAT_ID_ENV) if CHAT_ID_ENV.isdigit() or (CHAT_ID_ENV and CHAT_ID_ENV[0] == "-" and CHAT_ID_ENV[1:].isdigit()) else None
+GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "").strip()  # purely informational for logs
+# Optional: if you set up a tiny Apps Script Web App that appends rows, put that URL here
+SHEET_WEBHOOK_URL = os.getenv("SHEET_WEBHOOK_URL", "").strip()
 
-DISCOVERY_INTERVAL = int(os.environ.get("DISCOVERY_INTERVAL_SECONDS", "60"))
-HEALTH_PORT = int(os.environ.get("PORT", "10000"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "10"))
 
-DEX_BASE = "https://api.dexscreener.com/latest/dex"
+# Polling (free-tier safe)
+DEX_CYCLE_SECONDS = int(os.getenv("DEX_CYCLE_SECONDS", "60"))
+BIRDEYE_CYCLE_SECONDS = int(os.getenv("BIRDEYE_CYCLE_SECONDS", "15"))
+HELIUS_CYCLE_SECONDS = int(os.getenv("HELIUS_CYCLE_SECONDS", "90"))
 
-# -----------------
-# Health server
-# -----------------
-async def _health_handler(_request: web.Request) -> web.Response:
-    return web.Response(text="ok")
+# DNA thresholds (tune yours here or load from Settings tab later)
+MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", "20000"))   # example: 20k
+MAX_FDV_USD = float(os.getenv("MAX_FDV_USD", "600000"))  # example: 600k
 
-async def start_health_server(port: int) -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/health", _health_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info("memecoin-dna-bot | Health server on :%s/health", port)
-    return runner
+# Safety thresholds (simple starters)
+TOP1_HOLDER_MAX_PCT = float(os.getenv("TOP1_HOLDER_MAX_PCT", "20.0"))
+TOP5_HOLDER_MAX_PCT = float(os.getenv("TOP5_HOLDER_MAX_PCT", "45.0"))
 
-# -----------------
-# Helpers
-# -----------------
-def _num(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
+# ========= GLOBALS =========
+seen_pairs: Dict[str, float] = {}       # pair_address -> last_seen_ts
+candidates: Dict[str, float] = {}       # pair_address -> ts_detected
+last_birdeye_check: Dict[str, float] = {}
+last_helius_check: Dict[str, float] = {}
 
-def _pair_age_minutes(p: Dict[str, Any]) -> float:
-    # DexScreener sometimes returns pairCreatedAt or creationTime in ms
-    ts = p.get("creationTime") or p.get("pairCreatedAt")
-    if ts is None:
-        return 999999.0
-    try:
-        ts = int(ts)
-        if ts > 10**12:  # ms
-            ts //= 1000
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
-    except Exception:
-        return 999999.0
+BACKOFF_BASE = 20  # seconds
 
-def _activity_score(p: Dict[str, Any]) -> int:
-    m5 = (p.get("txns") or {}).get("m5") or {}
-    return int(_num(m5.get("buys"), 0) + _num(m5.get("sells"), 0))
 
-def _format_pair_line(p: Dict[str, Any]) -> str:
-    symbol = (p.get("baseToken") or {}).get("symbol") or "?"
-    fdv = int(_num(p.get("fdv"), 0))
-    liq = int(_num(((p.get("liquidity") or {}).get("usd")), 0))
-    url = p.get("url") or ""
-    return f"• {symbol} | FDV ${fdv:,} | LP ${liq:,}\n{url}"
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# -----------------
-# DexScreener fetch
-# -----------------
-async def fetch_latest_solana_pairs(limit: int = 120) -> List[Dict[str, Any]]:
-    url = f"{DEX_BASE}/search"
-    params = {"q": "solana"}
-    timeout = httpx.Timeout(15.0, read=15.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json() or {}
-        pairs = data.get("pairs", []) or []
 
-    # Only Solana
-    pairs = [p for p in pairs if p.get("chainId") == "solana"]
-
-    # Sort: newest or most active first
-    pairs.sort(key=lambda p: (int(1e9) - int(_num(p.get("pairCreatedAt") or p.get("creationTime"), 0)), _activity_score(p)))
-    return pairs[:limit]
-
-# -----------------
-# DNA filters (from your PDF)
-# -----------------
-def pass_basic_safety(p: Dict[str, Any]) -> bool:
-    # Quick protections: non-zero LP, some activity, not ancient
-    liq = _num((p.get("liquidity") or {}).get("usd"), 0)
-    if liq <= 0:
-        return False
-    if _activity_score(p) == 0:
-        return False
-    # treat "newish" as age < 72h for alerts; you can tighten later
-    if _pair_age_minutes(p) > 72 * 60:
-        return False
-    return True
-
-def dna_winner(p: Dict[str, Any]) -> bool:
-    if not pass_basic_safety(p):
-        return False
-    fdv = _num(p.get("fdv"))
-    liq = _num((p.get("liquidity") or {}).get("usd"))
-    return (fdv > 0 and fdv < 250_000) and (liq >= 15_000)
-
-def dna_tytty(p: Dict[str, Any]) -> bool:
-    if not pass_basic_safety(p):
-        return False
-    fdv = _num(p.get("fdv"))
-    liq = _num((p.get("liquidity") or {}).get("usd"))
-    return (fdv > 0 and fdv < 600_000) and (liq >= 20_000)
-
-def dna_strict(p: Dict[str, Any]) -> bool:
-    if not pass_basic_safety(p):
-        return False
-    fdv = _num(p.get("fdv"))
-    liq = _num((p.get("liquidity") or {}).get("usd"))
-    # We can't guarantee "LP locked or renounced" from this endpoint,
-    # but we can require stronger LP + activity as a proxy.
-    socials = (p.get("info") or {}).get("socials") or []
-    return (fdv > 0 and fdv < 500_000) and (liq >= 30_000) and (len(socials) > 0)
-
-# -----------------
-# Commands
-# -----------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Yo! Bot is live. I’ll ping when I spot DNA matches. Use /dna to see criteria.")
-
-async def dna_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "DNA screens:\n"
-        "• Winner: FDV < $250k, LP ≥ $15k (early, riskier)\n"
-        "• Tytty:  FDV < $600k, LP ≥ $20–30k (sweet spot)\n"
-        "• Strict: FDV < $500k, LP ≥ $30k + socials\n"
-        "All also require: some txns, non-zero LP, not ancient pairs."
-    )
-    await update.message.reply_text(text)
-
-async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("pong")
-
-# -----------------
-# Discovery job
-# -----------------
-def _dedupe_key(p: Dict[str, Any]) -> str:
-    return p.get("pairAddress") or p.get("pairId") or (p.get("baseToken") or {}).get("address") or (p.get("info") or {}).get("address") or p.get("url") or str(p)
-
-async def discovery_cycle(app: Application) -> None:
-    try:
-        pairs = await fetch_latest_solana_pairs(limit=150)
-
-        winners  = [p for p in pairs if dna_winner(p)]
-        tytties  = [p for p in pairs if dna_tytty(p)]
-        stricts  = [p for p in pairs if dna_strict(p)]
-
-        log.info("tick | pairs=%s | winner=%s tytty=%s strict=%s",
-                 len(pairs), len(winners), len(tytties), len(stricts))
-
-        # Dedupe: don't re-alert same pair twice
-        sent: set = app.bot_data.setdefault("sent_pairs", set())
-        buckets = [("🚀 Winner", winners), ("🔥 Tytty", tytties), ("🛡️ Strict", stricts)]
-
-        if TELEGRAM_CHAT_ID:
-            for label, items in buckets:
-                # keep only new items not previously sent
-                fresh = []
-                for p in items:
-                    key = _dedupe_key(p)
-                    if key and key not in sent:
-                        sent.add(key)
-                        fresh.append(p)
-
-                if fresh:
-                    lines = [_format_pair_line(p) for p in fresh[:6]]  # cap per tick
-                    msg = f"{label} hits ({len(fresh)})\n" + "\n\n".join(lines)
-                    try:
-                        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, disable_web_page_preview=True)
-                    except Exception:
-                        log.exception("send_message failed")
-    except httpx.HTTPStatusError as e:
-        log.error("discovery_cycle HTTP error: %s", e)
-    except Exception as e:
-        log.exception("discovery_cycle error: %s", e)
-
-async def discovery_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await discovery_cycle(context.application)
-
-# -----------------
-# Lifecycle
-# -----------------
-async def on_post_init(app: Application) -> None:
-    runner = await start_health_server(HEALTH_PORT)
-    app.bot_data["health_runner"] = runner
-
-    jq = app.job_queue
-    if jq is None:
-        log.error("JobQueue is None (should not happen if PTB installed with [job-queue])")
+async def telegram_send(session: httpx.AsyncClient, text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[telegram] missing token/chat_id, skipping")
         return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        await session.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    except Exception as e:
+        print(f"[telegram] error: {e}")
 
-    jq.run_repeating(discovery_job, interval=DISCOVERY_INTERVAL, first=5, name="discovery_cycle")
-    log.info("Scheduled discovery every %ss", DISCOVERY_INTERVAL)
 
-# -----------------
-# Build & run
-# -----------------
-def build_app() -> Application:
-    jq = JobQueue()
-    app: Application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .job_queue(jq)            # ensure JobQueue exists
-        .post_init(on_post_init)
-        .concurrent_updates(True)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("dna", dna_cmd))
-    app.add_handler(CommandHandler("ping", ping_cmd))
-    return app
+async def sheet_append(session: httpx.AsyncClient, tab: str, row: Dict[str, Any]):
+    """
+    Journaling: if you publish a tiny Google Apps Script Web App that accepts JSON and appends
+    to your sheet, put its URL in SHEET_WEBHOOK_URL. If empty, we just print.
+    """
+    payload = {"tab": tab, "row": row, "sheet_url": GOOGLE_SHEET_URL}
+    if not SHEET_WEBHOOK_URL:
+        print(f"[sheet:{tab}] {row}")
+        return
+    try:
+        r = await session.post(SHEET_WEBHOOK_URL, json=payload, timeout=15)
+        if r.status_code >= 300:
+            print(f"[sheet] webhook non-200: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"[sheet] webhook error: {e}")
 
-def main() -> None:
-    app = build_app()
-    app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None, close_loop=False)
+
+# ------------------ DATA LANES ------------------
+
+async def dexscreener_latest(session: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    url = "https://api.dexscreener.com/latest/dex/tokens/solana"
+    # Fallback endpoint (pairs) — some deployments use this:
+    alt_url = "https://api.dexscreener.com/latest/dex/search?q=solana"
+    for attempt in range(3):
+        try:
+            r = await session.get(url, timeout=20)
+            if r.status_code == 429:
+                wait = BACKOFF_BASE * (attempt + 1)
+                print(f"[dex] 429 rate-limit, backoff {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code >= 300:
+                print(f"[dex] {r.status_code} {r.text[:200]}; trying alt")
+                r = await session.get(alt_url, timeout=20)
+            data = r.json()
+            # Normalize: return a list of dicts with at least token/chain/pair address
+            pairs = data.get("pairs") or data.get("tokens") or []
+            return pairs
+        except Exception as e:
+            print(f"[dex] error: {e}; retrying…")
+            await asyncio.sleep(2)
+    return []
+
+
+async def birdeye_price_liq(session: httpx.AsyncClient, token_address: str) -> Optional[Dict[str, Any]]:
+    if not BIRDEYE_API_KEY:
+        return None
+    url = "https://public-api.birdeye.so/defi/price"
+    headers = {"X-API-KEY": BIRDEYE_API_KEY, "accept": "application/json"}
+    params = {"chain": "solana", "address": token_address, "include_liquidity": "true"}
+    try:
+        r = await session.get(url, headers=headers, params=params, timeout=20)
+        if r.status_code == 429:
+            print("[birdeye] 429; backing off 20s")
+            await asyncio.sleep(20)
+            return None
+        if r.status_code >= 300:
+            print(f"[birdeye] {r.status_code} {r.text[:200]}")
+            return None
+        return r.json().get("data")
+    except Exception as e:
+        print(f"[birdeye] error: {e}")
+        return None
+
+
+async def helius_holder_safety(session: httpx.AsyncClient, token_mint: str) -> Optional[Dict[str, Any]]:
+    """
+    Minimal safety snapshot. If HELIUS API changes, we handle errors gracefully.
+    We attempt a common holders endpoint; if it fails, we return None (skip safety).
+    """
+    if not HELIUS_API_KEY:
+        return None
+    # Try a holders endpoint (if unavailable, function returns None)
+    # Example (subject to change by Helius): /v0/tokens/holders?tokenMint=...&api-key=...
+    url = f"https://api.helius.xyz/v0/tokens/holders?tokenMint={token_mint}&api-key={HELIUS_API_KEY}"
+    try:
+        r = await session.get(url, timeout=25)
+        if r.status_code == 429:
+            print("[helius] 429; backing off 20s")
+            await asyncio.sleep(20)
+            return None
+        if r.status_code >= 300:
+            print(f"[helius] {r.status_code} {r.text[:200]}")
+            return None
+        data = r.json()
+        holders = data.get("holders") or []
+        total = sum([h.get("amount", 0) for h in holders]) or 1
+        # Sort by amount, compute simple concentration
+        holders_sorted = sorted(holders, key=lambda x: x.get("amount", 0), reverse=True)
+        top1 = (holders_sorted[0]["amount"] / total * 100) if holders_sorted else 0.0
+        top5 = (sum([h.get("amount", 0) for h in holders_sorted[:5]]) / total * 100) if holders_sorted else 0.0
+        risk = "ok"
+        if top1 > TOP1_HOLDER_MAX_PCT or top5 > TOP5_HOLDER_MAX_PCT:
+            risk = "warn"
+        return {"top1_pct": round(top1, 2), "top5_pct": round(top5, 2), "risk": risk}
+    except Exception as e:
+        print(f"[helius] error: {e}")
+        return None
+
+
+# ------------------ LOGIC ------------------
+
+def dna_pass_stub(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Simple DNA gate using fields commonly present in DexScreener results.
+    You can replace with your Strict/TTYL numbers.
+    """
+    # Try to read fdv, liquidity, and basic info safely
+    fdv = float(pair.get("fdv", 0) or 0)
+    liq = 0.0
+    try:
+        liq = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
+    except Exception:
+        pass
+
+    if fdv <= 0 or liq <= 0:
+        return None
+
+    if fdv <= MAX_FDV_USD and liq >= MIN_LIQ_USD:
+        return {"fdv": fdv, "liq": liq, "dna_type": "TTYL"}  # tag as your DNA flavor
+    return None
+
+
+async def process_candidate(session: httpx.AsyncClient, pair: Dict[str, Any]):
+    """
+    After DNA pass on Dex, we validate on Birdeye (price/liquidity),
+    then optional safety on Helius. If all green → soft/strong ding + journal.
+    """
+    # token/pair addresses differ depending on endpoint shape; try to extract safely
+    address = pair.get("baseToken", {}).get("address") or pair.get("tokenAddress") or pair.get("pairAddress")
+    symbol = pair.get("baseToken", {}).get("symbol") or pair.get("symbol") or "?"
+    chain = pair.get("chainId") or pair.get("chain") or "solana"
+    dex_url = pair.get("url") or pair.get("pairLink") or ""
+
+    ts = utcnow_iso()
+    row = {
+        "ts_detected": ts,
+        "pair_address": address,
+        "symbol": symbol,
+        "chain": chain,
+        "dex_url": dex_url,
+    }
+
+    # Birdeye lane (liquidity/price/spread)
+    bi = await birdeye_price_liq(session, address) if address else None
+    if bi:
+        row.update({
+            "birdeye_price": bi.get("valueUsd"),
+            "birdeye_liq": bi.get("liquidity", {}).get("usd") if isinstance(bi.get("liquidity"), dict) else bi.get("liquidity"),
+            "birdeye_success": True
+        })
+    else:
+        row["birdeye_success"] = False
+
+    # Helius lane (holder/safety)
+    hel = await helius_holder_safety(session, address) if address else None
+    if hel:
+        row.update({
+            "top1_holder_pct": hel.get("top1_pct"),
+            "top5_holder_pct": hel.get("top5_pct"),
+            "helius_risk": hel.get("risk"),
+            "helius_success": True
+        })
+    else:
+        row["helius_success"] = False
+
+    # Decide ding level
+    soft_ok = bi is not None
+    safety_ok = (hel is None) or (hel and hel.get("risk") == "ok")  # if helius missing, don't block
+
+    if soft_ok and safety_ok:
+        # STRONG DING if we got Birdeye AND (no risk or Helius ok)
+        await telegram_send(session, f"🧬 STRONG DING: {symbol}\nLiq≈${row.get('birdeye_liq')}\nTop1:{row.get('top1_holder_pct','?')}% Top5:{row.get('top5_holder_pct','?')}%\n{dex_url}")
+        await sheet_append(session, "Dings", {
+            "ts_ding": ts,
+            "pair_address": address,
+            "symbol": symbol,
+            "ding_tier": "Strong",
+            "mc_at_ding": pair.get("fdv"),
+            "liq_at_ding": row.get("birdeye_liq"),
+            "dna_flavor": "TTYL",
+            "safety_snapshot": "OK" if safety_ok else "WARN",
+            "dex_url": dex_url
+        })
+    else:
+        # CANDIDATE / WATCHLIST only
+        await telegram_send(session, f"👀 Watchlist: {symbol}\n(birdeye:{'OK' if bi else 'MISS'} / helius:{'OK' if safety_ok else 'WARN'})\n{dex_url}")
+
+    # Always record candidate
+    await sheet_append(session, "Candidates", {
+        **row,
+        "status": "watching" if soft_ok else "pending"
+    })
+
+
+async def discovery_cycle():
+    """
+    Runs every DEX_CYCLE_SECONDS:
+    - fetch latest pairs
+    - run DNA
+    - enqueue candidates for birdeye/helius validation
+    """
+    async with httpx.AsyncClient(timeout=30) as session:
+        # Startup ping
+        await telegram_send(session, f"✅ Bot live @ {utcnow_iso()}\nSheet: {GOOGLE_SHEET_URL or 'not set'}")
+        backoff = 0
+
+        while True:
+            started = time.time()
+            try:
+                pairs = await dexscreener_latest(session)
+                print(f"[dex] fetched {len(pairs)} items")
+                now_ts = time.time()
+
+                for p in pairs:
+                    addr = p.get("baseToken", {}).get("address") or p.get("tokenAddress") or p.get("pairAddress")
+                    if not addr:
+                        continue
+
+                    # Cooldown / dedupe
+                    last = seen_pairs.get(addr, 0)
+                    if now_ts - last < COOLDOWN_MINUTES * 60:
+                        continue
+
+                    # DNA gate
+                    dna = dna_pass_stub(p)
+                    if not dna:
+                        continue
+
+                    # record seen + candidate
+                    seen_pairs[addr] = now_ts
+                    candidates[addr] = now_ts
+
+                    # add DNA info for journaling
+                    await sheet_append(session, "Candidates", {
+                        "ts_detected": utcnow_iso(),
+                        "pair_address": addr,
+                        "symbol": p.get("baseToken", {}).get("symbol") or p.get("symbol") or "?",
+                        "chain": p.get("chainId") or p.get("chain") or "solana",
+                        "dex_url": p.get("url") or p.get("pairLink") or "",
+                        "mc_at_detect": dna["fdv"],
+                        "liq_at_detect": dna["liq"],
+                        "dna_pass_type": dna["dna_type"],
+                        "why_candidate": "FDV≤cap & liq≥floor",
+                        "status": "candidate"
+                    })
+
+                    # Validate lanes (Birdeye/Helius) staggered to avoid bursts
+                    await process_candidate(session, p)
+                    await asyncio.sleep(3)  # small stagger between candidates
+
+                # reset backoff on success
+                backoff = 0
+
+            except Exception as e:
+                print(f"[loop] error: {e}")
+                backoff = min(backoff + 1, 3)
+                sleep_for = BACKOFF_BASE * backoff
+                print(f"[loop] backing off {sleep_for}s")
+                await asyncio.sleep(sleep_for)
+
+            # Respect DEX cycle cadence
+            elapsed = time.time() - started
+            sleep_left = max(DEX_CYCLE_SECONDS - elapsed, 5)
+            await asyncio.sleep(sleep_left)
+
+
+def main():
+    print("Starting MemeBot Phase-1…")
+    print(f"Keys: Birdeye={'yes' if BIRDEYE_API_KEY else 'no'} | Helius={'yes' if HELIUS_API_KEY else 'no'}")
+    print(f"Sheet: {GOOGLE_SHEET_URL or 'not set'}  (webhook: {'yes' if SHEET_WEBHOOK_URL else 'no'})")
+    print(f"Cycle: Dex={DEX_CYCLE_SECONDS}s | Birdeye={BIRDEYE_CYCLE_SECONDS}s | Helius={HELIUS_CYCLE_SECONDS}s")
+    asyncio.run(discovery_cycle())
+
 
 if __name__ == "__main__":
     main()
-
 
