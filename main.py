@@ -1,13 +1,14 @@
 # main.py
-# MemeBot (Tytty + Follow-up) — FULL VERSION
-# ✔ Builders + Near-Miss + Promotion follow-ups
-# ✔ BirdEye + Helius safety
-# ✔ Google Sheets journaling: NearMisses, Candidates, Dings
-# ✔ Best-pool per token (avoid dust pools)
-# ✔ Age ≤ 72h + activity ≥ 3 txns/5m sanity
-# ✔ Render keep-alive web server (PORT) so service stays up 24/7
+# MemeBot (Tytty + Follow-up) — FULL + Commands + Render Keep-Alive
+# - Builders / Near-miss bands with 15s rechecks for 5m
+# - Promotion to >=$20k LP -> BirdEye + Helius -> Strong Ding
+# - Holder safety: Top1<=25%, Top5<=45% (warn -> Watchlist)
+# - Google Sheets journaling: NearMisses, Candidates, Dings
+# - Telegram commands: /start /ping /dna /help /scan <mint-or-url>
+# - Render keep-alive web server (PORT)
 
 import os
+import re
 import asyncio
 import json
 import time
@@ -17,7 +18,7 @@ from typing import Dict, Any, Optional, List
 import httpx
 from aiohttp import web  # keep-alive web server
 
-# ========= Render Keep Alive (starts once) =========
+# ========= Render Keep Alive =========
 async def _health_handle(request):
     return web.Response(text="ok")
 
@@ -30,26 +31,25 @@ async def start_health_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"[health] dummy server running on port {port}")
-# ===================================================
+# =====================================
 
 # ========= ENV =========
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()  # required for liq/price lane
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()    # optional safety lane
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 
-GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "").strip()  # purely informational for logs
-SHEET_WEBHOOK_URL = os.getenv("SHEET_WEBHOOK_URL", "").strip()  # Apps Script Web App URL (optional)
+GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "").strip()
+SHEET_WEBHOOK_URL = os.getenv("SHEET_WEBHOOK_URL", "").strip()
 
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "3"))
 
-# Polling
 DEX_CYCLE_SECONDS = int(os.getenv("DEX_CYCLE_SECONDS", "30"))
 BIRDEYE_CYCLE_SECONDS = int(os.getenv("BIRDEYE_CYCLE_SECONDS", "15"))
 HELIUS_CYCLE_SECONDS = int(os.getenv("HELIUS_CYCLE_SECONDS", "90"))
 
-# DNA thresholds (Tytty)
+# DNA thresholds
 MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", "20000"))
 MAX_FDV_USD = float(os.getenv("MAX_FDV_USD", "600000"))
 
@@ -59,33 +59,34 @@ BUILDER_MAX_LP = float(os.getenv("BUILDER_MAX_LP", "9000"))
 NEAR_MIN_LP = float(os.getenv("NEAR_MIN_LP", "15000"))
 NEAR_MAX_LP = float(os.getenv("NEAR_MAX_LP", "19900"))
 
-AGE_MAX_MINUTES = float(os.getenv("AGE_MAX_MINUTES", "4320"))  # ≤72h
+AGE_MAX_MINUTES = float(os.getenv("AGE_MAX_MINUTES", "4320"))  # 72h
 MIN_TXNS_5M = int(os.getenv("MIN_TXNS_5M", "3"))
 
-NEAR_WINDOW_SECONDS = float(os.getenv("NEAR_WINDOW_SECONDS", "300"))   # 5m watch window
-NEAR_RECHECK_SECONDS = float(os.getenv("NEAR_RECHECK_SECONDS", "15"))  # fast follow-up
+NEAR_WINDOW_SECONDS = float(os.getenv("NEAR_WINDOW_SECONDS", "300"))   # 5m
+NEAR_RECHECK_SECONDS = float(os.getenv("NEAR_RECHECK_SECONDS", "15"))  # 15s
 
-# Holder safety (Top1 bumped to 25% as requested)
+# Holder safety (your latest)
 TOP1_HOLDER_MAX_PCT = float(os.getenv("TOP1_HOLDER_MAX_PCT", "25.0"))
 TOP5_HOLDER_MAX_PCT = float(os.getenv("TOP5_HOLDER_MAX_PCT", "45.0"))
 REQUIRE_HELIUS_OK = os.getenv("SAFETY_REQUIRE_HELIUS_OK", "false").lower() == "true"
 
 # ========= GLOBALS =========
-seen_pairs: Dict[str, float] = {}       # pair_address -> last_seen_ts
-candidates: Dict[str, float] = {}       # pair_address -> ts_detected
-near_watch: Dict[str, float] = {}       # token_addr -> expire_ts (LP 15–19.9k)
-builder_watch: Dict[str, float] = {}    # token_addr -> expire_ts (LP 5–9k, new+active)
-BACKOFF_BASE = 20  # seconds
+seen_pairs: Dict[str, float] = {}
+candidates: Dict[str, float] = {}
+near_watch: Dict[str, float] = {}       # token_addr -> expire_ts
+builder_watch: Dict[str, float] = {}    # token_addr -> expire_ts
+BACKOFF_BASE = 20
 
+# Telegram state
+LAST_UPDATE_ID = 0
 
 # ========= UTILS =========
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-
 async def telegram_send(session: httpx.AsyncClient, text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[telegram] missing token/chat_id, skipping")
+        print("[telegram] missing token/chat_id, skipping send")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
@@ -93,6 +94,23 @@ async def telegram_send(session: httpx.AsyncClient, text: str):
     except Exception as e:
         print(f"[telegram] error: {e}")
 
+async def telegram_get_updates(session: httpx.AsyncClient, offset: int) -> list:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        r = await session.get(url, params={"timeout": 20, "offset": offset}, timeout=25)
+        data = r.json() if r.status_code < 300 else {}
+        return data.get("result", [])
+    except Exception as e:
+        print(f"[telegram] getUpdates error: {e}")
+        return []
+
+def _allowed_chat(chat_id: int) -> bool:
+    if not TELEGRAM_CHAT_ID:
+        return True
+    try:
+        return str(chat_id) == str(TELEGRAM_CHAT_ID)
+    except:
+        return False
 
 async def sheet_append(session: httpx.AsyncClient, tab: str, row: Dict[str, Any]):
     payload = {"tab": tab, "row": row, "sheet_url": GOOGLE_SHEET_URL}
@@ -106,14 +124,8 @@ async def sheet_append(session: httpx.AsyncClient, tab: str, row: Dict[str, Any]
     except Exception as e:
         print(f"[sheet] webhook error: {e}")
 
-
 def _fdv_usd(pair: Dict[str, Any]) -> float:
-    return float(
-        pair.get("fdv")
-        or pair.get("marketCap")
-        or (pair.get("info") or {}).get("fdv")
-        or 0
-    )
+    return float(pair.get("fdv") or pair.get("marketCap") or (pair.get("info") or {}).get("fdv") or 0)
 
 def _liq_usd(pair: Dict[str, Any]) -> float:
     liq = (pair.get("liquidity") or {})
@@ -128,7 +140,7 @@ def _liq_usd(pair: Dict[str, Any]) -> float:
 def _pair_age_minutes(pair: Dict[str, Any]) -> float:
     ts = pair.get("creationTime") or pair.get("pairCreatedAt")
     try:
-        ts = int(ts) if ts is not None else 0
+        ts = int(ts) if ts else 0
         if ts > 10**12:
             ts //= 1000
         if ts <= 0:
@@ -140,9 +152,7 @@ def _pair_age_minutes(pair: Dict[str, Any]) -> float:
 
 def _txns_m5(pair: Dict[str, Any]) -> int:
     m5 = (pair.get("txns") or {}).get("m5") or {}
-    buys = int((m5.get("buys") or 0))
-    sells = int((m5.get("sells") or 0))
-    return buys + sells
+    return int((m5.get("buys") or 0)) + int((m5.get("sells") or 0))
 
 def _addr_of(pair: Dict[str, Any]) -> Optional[str]:
     return (pair.get("baseToken") or {}).get("address") or pair.get("tokenAddress") or pair.get("pairAddress")
@@ -159,7 +169,6 @@ def best_by_token(pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             by_token[t] = (liq, p)
     return [v[1] for v in by_token.values()]
 
-
 # ========= DATA LANES =========
 async def dexscreener_latest(session: httpx.AsyncClient) -> List[Dict[str, Any]]:
     urls = [
@@ -175,9 +184,6 @@ async def dexscreener_latest(session: httpx.AsyncClient) -> List[Dict[str, Any]]
                     print(f"[dex] 429 rate-limit, backoff {wait}s")
                     await asyncio.sleep(wait)
                     continue
-                if r.status_code >= 300:
-                    print(f"[dex] {r.status_code} {r.text[:200]}")
-                    continue
                 data = r.json() or {}
                 pairs = data.get("pairs") or data.get("tokens") or []
                 pairs = [p for p in pairs if (p.get("chainId") or p.get("chain")) == "solana"]
@@ -186,7 +192,6 @@ async def dexscreener_latest(session: httpx.AsyncClient) -> List[Dict[str, Any]]
                 print(f"[dex] error: {e}; retrying…")
                 await asyncio.sleep(2)
     return []
-
 
 async def birdeye_price_liq(session: httpx.AsyncClient, token_address: str) -> Optional[Dict[str, Any]]:
     if not BIRDEYE_API_KEY:
@@ -207,7 +212,6 @@ async def birdeye_price_liq(session: httpx.AsyncClient, token_address: str) -> O
     except Exception as e:
         print(f"[birdeye] error: {e}")
         return None
-
 
 async def helius_holder_safety(session: httpx.AsyncClient, token_mint: str) -> Optional[Dict[str, Any]]:
     if not HELIUS_API_KEY:
@@ -236,42 +240,76 @@ async def helius_holder_safety(session: httpx.AsyncClient, token_mint: str) -> O
         print(f"[helius] error: {e}")
         return None
 
-
-# ========= DNA GATE =========
-def dna_pass_stub(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Tytty DNA gate with builder/near bands + age/activity sanity.
-    Returns one of: {"status": "pass" | "near" | "builder"} or None.
-    """
+# ========= DNA (with explanations) =========
+def dna_pass_explain(pair: Dict[str, Any]) -> Dict[str, Any]:
     fdv = _fdv_usd(pair)
     liq = _liq_usd(pair)
+    age_min = _pair_age_minutes(pair)
+    tx5 = _txns_m5(pair)
+
     if fdv <= 0 or liq <= 0:
-        return None
+        return {"status": "reject", "why": "missing fdv/liq", "fdv": fdv, "liq": liq}
+    if age_min > AGE_MAX_MINUTES:
+        return {"status": "reject", "why": f"too old {age_min:.1f}m>{AGE_MAX_MINUTES}m", "fdv": fdv, "liq": liq}
+    if tx5 < MIN_TXNS_5M:
+        return {"status": "reject", "why": f"low activity tx5={tx5}<{MIN_TXNS_5M}", "fdv": fdv, "liq": liq}
 
-    # sanity: recent + alive
-    if _pair_age_minutes(pair) > AGE_MAX_MINUTES:
-        return None
-    if _txns_m5(pair) < MIN_TXNS_5M:
-        return None
-
-    # 1) confirmed Tytty
     if fdv <= MAX_FDV_USD and liq >= MIN_LIQ_USD:
-        return {"fdv": fdv, "liq": liq, "dna_type": "TTYL", "status": "pass"}
-
-    # 2) near-miss band
+        return {"status": "pass", "why": "meets floor", "fdv": fdv, "liq": liq}
     if fdv <= MAX_FDV_USD and NEAR_MIN_LP <= liq <= NEAR_MAX_LP:
-        return {"fdv": fdv, "liq": liq, "dna_type": "TTYL", "status": "near"}
-
-    # 3) early builder band (already checked age+txns)
+        return {"status": "near", "why": "near-miss band", "fdv": fdv, "liq": liq}
     if BUILDER_MIN_LP <= liq <= BUILDER_MAX_LP:
-        return {"fdv": fdv, "liq": liq, "dna_type": "TTYL", "status": "builder"}
+        return {"status": "builder", "why": "early-builder band", "fdv": fdv, "liq": liq}
+    return {"status": "reject", "why": "outside all bands", "fdv": fdv, "liq": liq}
 
+# ========= Telegram: /scan helper =========
+def _extract_mint(text: str) -> Optional[str]:
+    text = text.strip()
+    if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", text):
+        return text
+    m = re.search(r"dexscreener\.com/solana/([A-Za-z0-9]+)", text)
+    if m:
+        return m.group(1)
     return None
 
+async def scan_one(session: httpx.AsyncClient, mint_or_url: str):
+    mint = _extract_mint(mint_or_url)
+    if not mint:
+        await telegram_send(session, "⚠️ /scan needs a Solana mint or DexScreener URL.")
+        return
+    try:
+        r = await session.get("https://api.dexscreener.com/latest/dex/search", params={"q": mint}, timeout=20)
+        data = r.json() if r.status_code < 300 else {}
+        pairs = data.get("pairs") or []
+    except Exception as e:
+        await telegram_send(session, f"⚠️ Dex error: {e}")
+        return
+    if not pairs:
+        await telegram_send(session, "❔ No pairs found for that mint yet.")
+        return
+    # choose highest-LP pool
+    p = max(pairs, key=lambda x: (_liq_usd(x) or 0))
+    sym = (p.get("baseToken") or {}).get("symbol") or p.get("symbol") or "?"
+    liq = _liq_usd(p); fdv = _fdv_usd(p); age_m = round(_pair_age_minutes(p), 1); tx5 = _txns_m5(p)
+    await telegram_send(session, f"🔎 Scan {sym}: LP=${int(liq):,} | FDV=${int(fdv):,} | age={age_m}m | 5m txns={tx5}")
+    verdict = dna_pass_explain(p)
+    await telegram_send(session, f"🧪 DNA verdict: {verdict['status']} (why: {verdict['why']})")
+    if verdict["status"] == "pass":
+        await process_candidate(session, p)
+    else:
+        # optional: still show safety snapshot
+        addr = _addr_of(p)
+        bi = await birdeye_price_liq(session, addr) if addr else None
+        hel = await helius_holder_safety(session, addr) if addr else None
+        if bi:
+            l = bi.get("liquidity", {})
+            l = (l.get("usd") if isinstance(l, dict) else l) or 0
+            await telegram_send(session, f"ℹ️ BirdEye LP≈${int(float(l)):,}")
+        if hel:
+            await telegram_send(session, f"ℹ️ Holders: Top1={hel.get('top1_pct')}% Top5={hel.get('top5_pct')}% risk={hel.get('risk')}")
 
 # ========= CORE LOGIC =========
 async def process_candidate(session: httpx.AsyncClient, pair: Dict[str, Any]):
-    """After DNA pass, validate on BirdEye + (optional) Helius, then ding/journal."""
     address = _addr_of(pair)
     symbol = (pair.get("baseToken") or {}).get("symbol") or pair.get("symbol") or "?"
     chain = pair.get("chainId") or pair.get("chain") or "solana"
@@ -309,7 +347,6 @@ async def process_candidate(session: httpx.AsyncClient, pair: Dict[str, Any]):
     else:
         row["helius_success"] = False
 
-    # Decide ding level
     safety_ok = (hel is None) or (hel and hel.get("risk") == "ok")
     if REQUIRE_HELIUS_OK and not safety_ok:
         await telegram_send(session, f"👀 Watchlist (holder risk): {symbol}\nTop1:{row.get('top1_holder_pct','?')}% Top5:{row.get('top5_holder_pct','?')}%\n{dex_url}")
@@ -332,17 +369,61 @@ async def process_candidate(session: httpx.AsyncClient, pair: Dict[str, Any]):
     else:
         await telegram_send(session, f"👀 Watchlist: {symbol}\n(birdeye:{'OK' if bi else 'MISS'} / helius:{'OK' if safety_ok else 'WARN'})\n{dex_url}")
 
-    # Always record candidate
-    await sheet_append(session, "Candidates", {
-        **row,
-        "status": "candidate"
-    })
+    await sheet_append(session, "Candidates", {**row, "status": "candidate"})
 
+# ========= Telegram command loop =========
+async def telegram_command_loop(session: httpx.AsyncClient):
+    global LAST_UPDATE_ID
+    print("[tg] command loop started")
+    while True:
+        updates = await telegram_get_updates(session, LAST_UPDATE_ID)
+        for u in updates:
+            try:
+                LAST_UPDATE_ID = max(LAST_UPDATE_ID, int(u.get("update_id", 0)) + 1)
+                msg = u.get("message") or u.get("edited_message") or {}
+                chat = msg.get("chat", {}) or {}
+                chat_id = chat.get("id")
+                text = (msg.get("text") or "").strip()
+                if not chat_id or not text or not _allowed_chat(chat_id):
+                    continue
+                low = text.lower()
+                if low.startswith("/start"):
+                    await telegram_send(session,
+                        "👋 I’m live.\n"
+                        f"Sheet: {GOOGLE_SHEET_URL or 'not set'}\n"
+                        "Commands: /ping /dna /scan <mint-or-url> /help")
+                elif low.startswith("/ping"):
+                    await telegram_send(session, f"🏓 pong — {utcnow_iso()}")
+                elif low.startswith("/dna"):
+                    await telegram_send(session,
+                        "🧬 DNA settings:\n"
+                        f"- LP floor: ${int(MIN_LIQ_USD):,}\n"
+                        f"- FDV cap:  ${int(MAX_FDV_USD):,}\n"
+                        f"- Near band: ${int(NEAR_MIN_LP):,}–${int(NEAR_MAX_LP):,}\n"
+                        f"- Builder band: ${int(BUILDER_MIN_LP):,}–${int(BUILDER_MAX_LP):,}\n"
+                        f"- Age ≤ {int(AGE_MAX_MINUTES/60)}h, 5m txns ≥ {MIN_TXNS_5M}\n"
+                        f"- Holders: Top1 ≤ {TOP1_HOLDER_MAX_PCT}%, Top5 ≤ {TOP5_HOLDER_MAX_PCT}%")
+                elif low.startswith("/help"):
+                    await telegram_send(session, "Commands: /ping /dna /scan <mint-or-url> /help")
+                elif low.startswith("/scan"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) == 2:
+                        await scan_one(session, parts[1])
+                    else:
+                        await telegram_send(session, "Usage: /scan <mint-or-dexscreener-url>")
+            except Exception as e:
+                print(f"[tg] handle error: {e}")
+                continue
+        await asyncio.sleep(2)
 
+# ========= DISCOVERY LOOP =========
 async def discovery_cycle():
     async with httpx.AsyncClient(timeout=30) as session:
-        # Start the keep-alive server once
+        # start keep-alive web server once
         await start_health_server()
+
+        # start command listener
+        asyncio.create_task(telegram_command_loop(session))
 
         # Startup ping
         await telegram_send(session, f"✅ Bot live @ {utcnow_iso()}\nSheet: {GOOGLE_SHEET_URL or 'not set'}")
@@ -352,7 +433,7 @@ async def discovery_cycle():
             started = time.time()
             try:
                 pairs = await dexscreener_latest(session)
-                pairs = best_by_token(pairs)  # highest-LP pool per token
+                pairs = best_by_token(pairs)
                 print(f"[dex] fetched {len(pairs)} items")
                 now_ts = time.time()
 
@@ -361,13 +442,16 @@ async def discovery_cycle():
                     if not addr:
                         continue
 
-                    # Cooldown / dedupe
                     last = seen_pairs.get(addr, 0)
                     if now_ts - last < COOLDOWN_MINUTES * 60:
                         continue
 
-                    dna = dna_pass_stub(p)
-                    if not dna:
+                    verdict = dna_pass_explain(p)
+                    status = verdict["status"]
+
+                    if status == "reject":
+                        # optional debug
+                        # print(f"[dna:reject] {addr} {verdict['why']} LP={int(verdict['liq'])} FDV={int(verdict['fdv'])}")
                         builder_watch.pop(addr, None)
                         near_watch.pop(addr, None)
                         continue
@@ -375,19 +459,18 @@ async def discovery_cycle():
                     sym = (p.get("baseToken") or {}).get("symbol") or p.get("symbol") or "?"
                     url = p.get("url") or p.get("pairLink") or ""
 
-                    if dna["status"] == "pass":
+                    if status == "pass":
                         seen_pairs[addr] = now_ts
                         candidates[addr] = now_ts
-                        # journal detection
                         await sheet_append(session, "Candidates", {
                             "ts_detected": utcnow_iso(),
                             "pair_address": addr,
                             "symbol": sym,
                             "chain": p.get("chainId") or p.get("chain") or "solana",
                             "dex_url": url,
-                            "mc_at_detect": dna["fdv"],
-                            "liq_at_detect": dna["liq"],
-                            "dna_pass_type": dna["dna_type"],
+                            "mc_at_detect": verdict["fdv"],
+                            "liq_at_detect": verdict["liq"],
+                            "dna_pass_type": "TTYL",
                             "why_candidate": "FDV≤cap & liq≥floor",
                             "status": "candidate"
                         })
@@ -397,35 +480,36 @@ async def discovery_cycle():
                         near_watch.pop(addr, None)
                         continue
 
-                    elif dna["status"] == "near":
+                    if status == "near":
                         exp = now_ts + NEAR_WINDOW_SECONDS
                         if addr not in near_watch:
                             near_watch[addr] = exp
-                            await telegram_send(session, f"🟨 Near-miss: {sym} LP≈${int(dna['liq']):,} (needs ≥ ${int(MIN_LIQ_USD):,})\nWatching ~{int(exp-now_ts)}s\n{url}")
+                            await telegram_send(session, f"🟨 Near-miss: {sym} LP≈${int(verdict['liq']):,} (needs ≥ ${int(MIN_LIQ_USD):,})\nWatching ~{int(exp-now_ts)}s\n{url}")
                             await sheet_append(session, "NearMisses", {
                                 "ts": utcnow_iso(), "pair_address": addr, "symbol": sym,
-                                "fdv": dna["fdv"], "lp": dna["liq"], "status": "near", "url": url
+                                "fdv": verdict["fdv"], "lp": verdict["liq"], "status": "near", "url": url
                             })
                         else:
                             near_watch[addr] = exp
                         continue
 
-                    elif dna["status"] == "builder":
+                    if status == "builder":
                         exp = now_ts + NEAR_WINDOW_SECONDS
                         if addr not in builder_watch:
                             builder_watch[addr] = exp
-                            await telegram_send(session, f"🟧 Early Builder: {sym} LP≈${int(dna['liq']):,} | Active + New\nWatching ~{int(exp-now_ts)}s\n{url}")
+                            await telegram_send(session, f"🟧 Early Builder: {sym} LP≈${int(verdict['liq']):,} | Active + New\nWatching ~{int(exp-now_ts)}s\n{url}")
                             await sheet_append(session, "NearMisses", {
                                 "ts": utcnow_iso(), "pair_address": addr, "symbol": sym,
-                                "fdv": dna["fdv"], "lp": dna["liq"], "status": "builder", "url": url
+                                "fdv": verdict["fdv"], "lp": verdict["liq"], "status": "builder", "url": url
                             })
                         else:
                             builder_watch[addr] = exp
                         continue
 
-                # -------- follow-up rechecks (builders + near) --------
+                # follow-up rechecks
                 if builder_watch or near_watch:
                     still_builder, still_near = {}, {}
+
                     # builders
                     for addr, exp in list(builder_watch.items()):
                         if time.time() > exp:
@@ -450,6 +534,7 @@ async def discovery_cycle():
                                     break
                             continue
                         still_builder[addr] = exp
+
                     # near
                     for addr, exp in list(near_watch.items()):
                         if time.time() > exp:
@@ -474,12 +559,13 @@ async def discovery_cycle():
                                     break
                             continue
                         still_near[addr] = exp
+
                     builder_watch = still_builder
                     near_watch = still_near
                     await asyncio.sleep(NEAR_RECHECK_SECONDS)
                     continue
 
-                # reset backoff on success
+                # success path
                 backoff = 0
 
             except Exception as e:
@@ -489,11 +575,9 @@ async def discovery_cycle():
                 print(f"[loop] backing off {sleep_for}s")
                 await asyncio.sleep(sleep_for)
 
-            # Respect DEX cycle cadence
             elapsed = time.time() - started
             sleep_left = max(DEX_CYCLE_SECONDS - elapsed, 5)
             await asyncio.sleep(sleep_left)
-
 
 def main():
     print("Starting MemeBot (Tytty + Follow-up)…")
@@ -504,9 +588,9 @@ def main():
     print(f"Holders: TOP1≤{TOP1_HOLDER_MAX_PCT}% TOP5≤{TOP5_HOLDER_MAX_PCT}% (require_ok={REQUIRE_HELIUS_OK})")
     asyncio.run(discovery_cycle())
 
-
 if __name__ == "__main__":
     main()
+
 
           
           
