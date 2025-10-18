@@ -507,6 +507,7 @@ async def discovery_cycle():
                         continue
 
                 # follow-up rechecks
+                global builder_watch, near_watch
                 if builder_watch or near_watch:
                     still_builder, still_near = {}, {}
 
