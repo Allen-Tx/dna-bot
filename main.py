@@ -418,6 +418,7 @@ async def telegram_command_loop(session: httpx.AsyncClient):
 
 # ========= DISCOVERY LOOP =========
 async def discovery_cycle():
+    global builder_watch, near_watch
     async with httpx.AsyncClient(timeout=30) as session:
         # start keep-alive web server once
         await start_health_server()
