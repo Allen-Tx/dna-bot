@@ -418,7 +418,6 @@ async def telegram_command_loop(session: httpx.AsyncClient):
 
 # ========= DISCOVERY LOOP =========
 async def discovery_cycle():
-    global builder_watch, near_watch
     async with httpx.AsyncClient(timeout=30) as session:
         # start keep-alive web server once
         await start_health_server()
@@ -429,7 +428,7 @@ async def discovery_cycle():
         # Startup ping
         await telegram_send(session, f"✅ Bot live @ {utcnow_iso()}\nSheet: {GOOGLE_SHEET_URL or 'not set'}")
         backoff = 0
-
+        global builder_watch, near_watch
         while True:
             started = time.time()
             try:
