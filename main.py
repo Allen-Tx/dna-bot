@@ -418,6 +418,9 @@ async def telegram_command_loop(session: httpx.AsyncClient):
 
 # ========= DISCOVERY LOOP =========
 async def discovery_cycle():
+    # FIX: declare globals once, at the very top of the function
+    global builder_watch, near_watch
+
     async with httpx.AsyncClient(timeout=30) as session:
         # start keep-alive web server once
         await start_health_server()
@@ -428,7 +431,7 @@ async def discovery_cycle():
         # Startup ping
         await telegram_send(session, f"✅ Bot live @ {utcnow_iso()}\nSheet: {GOOGLE_SHEET_URL or 'not set'}")
         backoff = 0
-        global builder_watch, near_watch
+
         while True:
             started = time.time()
             try:
@@ -450,8 +453,6 @@ async def discovery_cycle():
                     status = verdict["status"]
 
                     if status == "reject":
-                        # optional debug
-                        # print(f"[dna:reject] {addr} {verdict['why']} LP={int(verdict['liq'])} FDV={int(verdict['fdv'])}")
                         builder_watch.pop(addr, None)
                         near_watch.pop(addr, None)
                         continue
@@ -507,7 +508,6 @@ async def discovery_cycle():
                         continue
 
                 # follow-up rechecks
-                global builder_watch, near_watch
                 if builder_watch or near_watch:
                     still_builder, still_near = {}, {}
 
@@ -518,18 +518,21 @@ async def discovery_cycle():
                         bi = await birdeye_price_liq(session, addr)
                         liq_now = 0.0
                         if bi:
-                            liq = bi.get("liquidity", {})
-                            liq_now = (liq.get("usd") if isinstance(liq, dict) else liq) or 0
-                            try: liq_now = float(liq_now)
-                            except: liq_now = 0.0
+                            liq_obj = bi.get("liquidity", {})
+                            liq_now = (liq_obj.get("usd") if isinstance(liq_obj, dict) else liq_obj) or 0
+                            try:
+                                liq_now = float(liq_now)
+                            except:
+                                liq_now = 0.0
                         if liq_now >= MIN_LIQ_USD:
                             await telegram_send(session, f"🟩 Promoted: LP now ≈ ${int(liq_now):,} (≥ ${int(MIN_LIQ_USD):,}) — validating…")
                             pairs_now = await dexscreener_latest(session)
                             pairs_now = best_by_token(pairs_now)
                             for p2 in pairs_now:
                                 if _addr_of(p2) == addr:
-                                    seen_pairs[addr] = time.time()
-                                    candidates[addr] = time.time()
+                                    ts_now = time.time()
+                                    seen_pairs[addr] = ts_now
+                                    candidates[addr] = ts_now
                                     await process_candidate(session, p2)
                                     await asyncio.sleep(2)
                                     break
@@ -543,18 +546,21 @@ async def discovery_cycle():
                         bi = await birdeye_price_liq(session, addr)
                         liq_now = 0.0
                         if bi:
-                            liq = bi.get("liquidity", {})
-                            liq_now = (liq.get("usd") if isinstance(liq, dict) else liq) or 0
-                            try: liq_now = float(liq_now)
-                            except: liq_now = 0.0
+                            liq_obj = bi.get("liquidity", {})
+                            liq_now = (liq_obj.get("usd") if isinstance(liq_obj, dict) else liq_obj) or 0
+                            try:
+                                liq_now = float(liq_now)
+                            except:
+                                liq_now = 0.0
                         if liq_now >= MIN_LIQ_USD:
                             await telegram_send(session, f"🟩 Promoted: LP now ≈ ${int(liq_now):,} (≥ ${int(MIN_LIQ_USD):,}) — validating…")
                             pairs_now = await dexscreener_latest(session)
                             pairs_now = best_by_token(pairs_now)
                             for p2 in pairs_now:
                                 if _addr_of(p2) == addr:
-                                    seen_pairs[addr] = time.time()
-                                    candidates[addr] = time.time()
+                                    ts_now = time.time()
+                                    seen_pairs[addr] = ts_now
+                                    candidates[addr] = ts_now
                                     await process_candidate(session, p2)
                                     await asyncio.sleep(2)
                                     break
@@ -591,8 +597,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-          
-          
-                       
