@@ -137,33 +137,22 @@ def _liq_usd(pair: Dict[str, Any]) -> float:
     except Exception:
         return 0.0
 
-# --- FIXED: Unknown age returns None (don’t hard-reject) ---
-def _pair_age_minutes(pair: Dict[str, Any]) -> Optional[float]:
-    """
-    Return age in minutes if we can compute it, otherwise None (unknown).
-    """
+def _pair_age_minutes(pair: Dict[str, Any]) -> float:
     ts = pair.get("creationTime") or pair.get("pairCreatedAt")
     try:
         ts = int(ts) if ts else 0
-        if ts > 10**12:  # ms -> s
+        if ts > 10**12:
             ts //= 1000
         if ts <= 0:
-            return None  # unknown age
+            return 999999.0
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
     except Exception:
-        return None  # unknown age
+        return 999999.0
 
-# --- FIXED: Unknown txns returns None (don’t hard-reject) ---
-def _txns_m5(pair: Dict[str, Any]) -> Optional[int]:
-    """
-    Return 5-minute txn count if present; otherwise None (unknown).
-    """
+def _txns_m5(pair: Dict[str, Any]) -> int:
     m5 = (pair.get("txns") or {}).get("m5") or {}
-    has_keys = ("buys" in m5) or ("sells" in m5)
-    if not has_keys:
-        return None  # unknown activity
-    return int(m5.get("buys") or 0) + int(m5.get("sells") or 0)
+    return int((m5.get("buys") or 0)) + int((m5.get("sells") or 0))
 
 def _addr_of(pair: Dict[str, Any]) -> Optional[str]:
     return (pair.get("baseToken") or {}).get("address") or pair.get("tokenAddress") or pair.get("pairAddress")
@@ -182,7 +171,11 @@ def best_by_token(pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 # ========= DATA LANES =========
 async def dexscreener_latest(session: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    """
+    Stronger feed: try full Solana pairs first; fall back to search/tokens.
+    """
     urls = [
+        "https://api.dexscreener.com/latest/dex/pairs/solana",   # NEW: widest, live feed
         "https://api.dexscreener.com/latest/dex/search?q=solana",
         "https://api.dexscreener.com/latest/dex/tokens/solana",
     ]
@@ -255,18 +248,14 @@ async def helius_holder_safety(session: httpx.AsyncClient, token_mint: str) -> O
 def dna_pass_explain(pair: Dict[str, Any]) -> Dict[str, Any]:
     fdv = _fdv_usd(pair)
     liq = _liq_usd(pair)
-    age_min = _pair_age_minutes(pair)   # may be None (unknown)
-    tx5 = _txns_m5(pair)                # may be None (unknown)
+    age_min = _pair_age_minutes(pair)
+    tx5 = _txns_m5(pair)
 
     if fdv <= 0 or liq <= 0:
         return {"status": "reject", "why": "missing fdv/liq", "fdv": fdv, "liq": liq}
-
-    # Only reject for age if we actually know the age
-    if age_min is not None and age_min > AGE_MAX_MINUTES:
+    if age_min > AGE_MAX_MINUTES:
         return {"status": "reject", "why": f"too old {age_min:.1f}m>{AGE_MAX_MINUTES}m", "fdv": fdv, "liq": liq}
-
-    # Only reject for low activity if we actually know the 5m tx count
-    if tx5 is not None and tx5 < MIN_TXNS_5M:
+    if tx5 < MIN_TXNS_5M:
         return {"status": "reject", "why": f"low activity tx5={tx5}<{MIN_TXNS_5M}", "fdv": fdv, "liq": liq}
 
     if fdv <= MAX_FDV_USD and liq >= MIN_LIQ_USD:
@@ -275,7 +264,6 @@ def dna_pass_explain(pair: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "near", "why": "near-miss band", "fdv": fdv, "liq": liq}
     if BUILDER_MIN_LP <= liq <= BUILDER_MAX_LP:
         return {"status": "builder", "why": "early-builder band", "fdv": fdv, "liq": liq}
-
     return {"status": "reject", "why": "outside all bands", "fdv": fdv, "liq": liq}
 
 # ========= Telegram: /scan helper =========
@@ -303,19 +291,15 @@ async def scan_one(session: httpx.AsyncClient, mint_or_url: str):
     if not pairs:
         await telegram_send(session, "❔ No pairs found for that mint yet.")
         return
-    # choose highest-LP pool
     p = max(pairs, key=lambda x: (_liq_usd(x) or 0))
     sym = (p.get("baseToken") or {}).get("symbol") or p.get("symbol") or "?"
-    liq = _liq_usd(p); fdv = _fdv_usd(p); age_m = _pair_age_minutes(p)
-    age_s = f"{round(age_m,1)}m" if age_m is not None else "unknown"
-    tx5 = _txns_m5(p); tx_s = tx5 if tx5 is not None else "unknown"
-    await telegram_send(session, f"🔎 Scan {sym}: LP=${int(liq):,} | FDV=${int(fdv):,} | age={age_s} | 5m txns={tx_s}")
+    liq = _liq_usd(p); fdv = _fdv_usd(p); age_m = round(_pair_age_minutes(p), 1); tx5 = _txns_m5(p)
+    await telegram_send(session, f"🔎 Scan {sym}: LP=${int(liq):,} | FDV=${int(fdv):,} | age={age_m}m | 5m txns={tx5}")
     verdict = dna_pass_explain(p)
     await telegram_send(session, f"🧪 DNA verdict: {verdict['status']} (why: {verdict['why']})")
     if verdict["status"] == "pass":
         await process_candidate(session, p)
     else:
-        # optional: still show safety snapshot
         addr = _addr_of(p)
         bi = await birdeye_price_liq(session, addr) if addr else None
         hel = await helius_holder_safety(session, addr) if addr else None
@@ -436,11 +420,11 @@ async def telegram_command_loop(session: httpx.AsyncClient):
 
 # ========= DISCOVERY LOOP =========
 async def discovery_cycle():
-    # declare globals once, at the very top of the function
+    # Declare once at top
     global builder_watch, near_watch
 
     async with httpx.AsyncClient(timeout=30) as session:
-        # start keep-alive web server once
+        # keep-alive web server
         await start_health_server()
 
         # start command listener
@@ -590,7 +574,8 @@ async def discovery_cycle():
                     await asyncio.sleep(NEAR_RECHECK_SECONDS)
                     continue
 
-                # success path
+                # heartbeat so you know loop is alive
+                print(f"[loop] {utcnow_iso()} ok pairs={len(pairs)} builders={len(builder_watch)} near={len(near_watch)}")
                 backoff = 0
 
             except Exception as e:
