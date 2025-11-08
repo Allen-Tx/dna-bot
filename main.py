@@ -237,7 +237,7 @@ async def birdeye_new_tokens(session: httpx.AsyncClient, limit: int = 120) -> Li
     """
     if not BIRDEYE_API_KEY:
         return []
-    url = "https://public-api.birdeye.so/defi/token_list"
+    url = "https://public-api.birdeye.so/defi/trending_token"
     params = {"chain": "solana", "sort_by": "createdAt", "sort_type": "desc", "limit": str(limit)}
     out: List[Dict[str, Any]] = []
     try:
