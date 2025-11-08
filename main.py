@@ -1,7 +1,6 @@
-
 # main.py — Bird Call (MemeBot vNext, BirdEye-first engine)
-# Discovery via BirdEye • Telegram manual /check with journaling • Notify-once
-# Watchlists (near/builder) • Holder safety via Helius • Render keep-alive
+# Discovery via BirdEye • Telegram /check with journaling • Notify-once
+# Watchlists • Holder safety via Helius • Render keep-alive
 
 import os
 import re
@@ -73,7 +72,7 @@ COOLDOWN_MINUTES         = int(os.getenv("COOLDOWN_MINUTES", "15"))
 NOTIFY_COOLDOWN_MIN      = int(os.getenv("NOTIFY_COOLDOWN_MIN", "15"))
 REJECT_MEMORY_MINUTES    = int(os.getenv("REJECT_MEMORY_MINUTES", "180"))
 
-# Watchlists recheck pacing/window
+# Watchlists recheck/window
 WATCHLIST_RECHECK_SECONDS= float(os.getenv("WATCHLIST_RECHECK_SECONDS", "60"))
 WATCHLIST_WINDOW_SECONDS = float(os.getenv("WATCHLIST_WINDOW_SECONDS", "900"))
 
@@ -91,29 +90,26 @@ MANUAL_RETRY_WINDOW      = int(os.getenv("MANUAL_RETRY_WINDOW", "300"))
 PROVISIONAL_DING         = os.getenv("PROVISIONAL_DING", "false").lower() == "true"
 
 # ===================== Globals ================================
-seen_pairs: Dict[str, float]   = {}   # token_mint -> last seen ts
-notify_last: Dict[str, float]  = {}   # token_mint -> last notify ts
-reject_memory: Dict[str, float]= {}   # token_mint -> ignore until ts
-builder_watch: Dict[str, float]= {}   # token_mint -> expiry ts
-near_watch: Dict[str, float]   = {}   # token_mint -> expiry ts
+seen_pairs: Dict[str, float]   = {}
+notify_last: Dict[str, float]  = {}
+reject_memory: Dict[str, float]= {}
+builder_watch: Dict[str, float]= {}
+near_watch: Dict[str, float]   = {}
 
 # ===================== Utils =================================
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def _addr_of(p: Dict[str, Any]) -> Optional[str]:
-    # unify on token mint as the unique key
     return p.get("address") or (p.get("baseToken") or {}).get("address") or p.get("tokenAddress") or p.get("pairAddress")
 
 def _fdv_usd(p: Dict[str, Any]) -> float:
-    # BirdEye often returns 'fdv' under price/overview; fallback to any known keys
     try:
         return float(p.get("fdv") or (p.get("info") or {}).get("fdv") or p.get("marketCap") or 0)
     except Exception:
         return 0.0
 
 def _lp_usd(p: Dict[str, Any]) -> float:
-    # BirdEye price/overview returns {"liquidity":{"usd": ...}} or a number
     liq = p.get("liquidity")
     if isinstance(liq, dict):
         v = liq.get("usd")
@@ -128,7 +124,6 @@ def _lp_usd(p: Dict[str, Any]) -> float:
         return 0.0
 
 def _txns_m5(p: Dict[str, Any]) -> int:
-    # BirdEye price/overview may not expose m5; keep optional
     tx5 = p.get("tx5") or (p.get("txns") or {}).get("m5", {}).get("buys", 0) + (p.get("txns") or {}).get("m5", {}).get("sells", 0)
     try:
         return int(tx5 or 0)
@@ -136,7 +131,6 @@ def _txns_m5(p: Dict[str, Any]) -> int:
         return 0
 
 def _pair_age_minutes(p: Dict[str, Any]) -> float:
-    # BirdEye new-tokens typically includes createdAt/creationTime in seconds or ms
     ts = p.get("createdAt") or p.get("creationTime") or p.get("pairCreatedAt")
     try:
         ts = int(ts) if ts else 0
@@ -219,7 +213,6 @@ async def birdeye_price_liq(session: httpx.AsyncClient, token_address: str) -> O
         return None
 
 async def birdeye_overview(session: httpx.AsyncClient, token_address: str) -> Optional[Dict[str, Any]]:
-    # Optional richer snapshot (fdv, liquidity, holders, vol)
     if not BIRDEYE_API_KEY:
         return None
     url = "https://public-api.birdeye.so/defi/token_overview"
@@ -236,40 +229,51 @@ async def birdeye_overview(session: httpx.AsyncClient, token_address: str) -> Op
     except Exception:
         return None
 
+# ======= BirdEye discovery (replacement for old new-tokens) ===
 async def birdeye_new_tokens(session: httpx.AsyncClient, limit: int = 120) -> List[Dict[str, Any]]:
     """
-    Discovery feed: newest Solana tokens.
-    NOTE: BirdEye may return {data:[{address,symbol,createdAt,...}]}
+    Discovery via token_list (newest first). Normalizes to:
+    address, symbol, createdAt, url. Liquidity/FDV confirmed later via price API.
     """
     if not BIRDEYE_API_KEY:
         return []
-    url = "https://public-api.birdeye.so/defi/new-tokens"
-    params = {"chain": "solana", "limit": str(limit)}
+    url = "https://public-api.birdeye.so/defi/token_list"
+    params = {"chain": "solana", "sort_by": "createdAt", "sort_type": "desc", "limit": str(limit)}
     out: List[Dict[str, Any]] = []
     try:
         r = await session.get(url, headers=_be_headers(), params=params, timeout=25)
         if r.status_code in (429, 400):
-            print("[birdeye] new-tokens throttle; backoff 30s")
+            print("[birdeye] token_list throttle; backoff 30s")
             await asyncio.sleep(BIRDEYE_CYCLE_SECONDS)
             return []
         if r.status_code >= 300:
-            print(f"[birdeye] new-tokens {r.status_code}")
+            print(f"[birdeye] token_list {r.status_code}")
             return []
         data = r.json().get("data") or []
-        # normalize fields we rely on downstream
         for t in data:
-            t.setdefault("address", t.get("mint") or t.get("tokenAddress"))
-            t.setdefault("symbol", t.get("symbol") or t.get("ticker") or "?")
-        return data
+            mint = t.get("address") or t.get("mint") or t.get("tokenAddress") or t.get("mintAddress")
+            sym  = t.get("symbol") or t.get("ticker") or "?"
+            created = t.get("createdAt") or t.get("mintedAt") or t.get("creationTime") or 0
+            if not mint:
+                continue
+            out.append({
+                "address": mint,
+                "symbol": sym,
+                "createdAt": created,
+                "url": f"https://birdeye.so/token/{mint}?chain=solana"
+            })
+        seen=set(); dedup=[]
+        for p in out:
+            a=p["address"]
+            if a in seen: continue
+            seen.add(a); dedup.append(p)
+        return dedup
     except Exception as e:
-        print(f"[birdeye] new-tokens error: {e}")
-        return out
+        print(f"[birdeye] token_list error: {e}")
+        return []
 
 # ===================== Optional Dex backup =====================
 async def dexscreener_backup(session: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    """
-    Minimal backup radar in case BirdEye new-tokens is quiet.
-    """
     url = "https://api.dexscreener.com/latest/dex/pairs/solana"
     out: List[Dict[str, Any]] = []
     for attempt in range(3):
@@ -283,7 +287,6 @@ async def dexscreener_backup(session: httpx.AsyncClient) -> List[Dict[str, Any]]
             data = r.json()
             pairs = data.get("pairs") or []
             for p in pairs:
-                # map Dex fields to our unified schema
                 addr = (p.get("baseToken") or {}).get("address")
                 mapped = {
                     "address": addr,
@@ -298,7 +301,6 @@ async def dexscreener_backup(session: httpx.AsyncClient) -> List[Dict[str, Any]]
         except Exception as e:
             print(f"[dex] error: {e}")
             await asyncio.sleep(1.5)
-    # de-dupe by token mint
     seen=set(); dedup=[]
     for p in out:
         a=p.get("address")
@@ -335,10 +337,9 @@ async def helius_holder_safety(session: httpx.AsyncClient, token_mint: str) -> O
         return None
 
 # ===================== DNA & verdicts =========================
-def _meets_tx_gate(age_min: float, m5: int) -> bool:
-    # If we don't have tx data from BirdEye, allow leniency for very young pairs.
+def _meets_tx_gate(age_min: float, m5: Optional[int]) -> bool:
     if m5 is None:
-        return age_min <= YOUNG_AGE_MINUTES or True  # effectively bypass strict tx gate if unknown
+        return True if age_min <= YOUNG_AGE_MINUTES else True
     if age_min <= YOUNG_AGE_MINUTES:
         return m5 >= MIN_TXNS_5M_YOUNG
     return m5 >= MIN_TXNS_5M_OLD
@@ -347,7 +348,7 @@ def dna_verdict(p: Dict[str, Any]) -> Dict[str, Any]:
     fdv = _fdv_usd(p)
     lp  = _lp_usd(p)
     age = _pair_age_minutes(p)
-    m5  = _txns_m5(p) if "tx5" in p or "txns" in p else None  # optional
+    m5  = p.get("tx5") if "tx5" in p or "txns" in p else None
 
     if fdv <= 0 or lp <= 0:
         return {"status": "reject", "why": "missing fdv/liq", "fdv": fdv, "lp": lp, "age": age, "m5": m5 or 0}
@@ -357,7 +358,6 @@ def dna_verdict(p: Dict[str, Any]) -> Dict[str, Any]:
         req = MIN_TXNS_5M_YOUNG if age <= YOUNG_AGE_MINUTES else MIN_TXNS_5M_OLD
         return {"status": "reject", "why": f"low activity tx5={m5}<{req}", "fdv": fdv, "lp": lp, "age": age, "m5": m5 or 0}
 
-    # Pass bands
     if fdv <= MAX_FDV_USD and lp >= MIN_LIQ_USD:
         return {"status": "pass", "why": "meets floor", "fdv": fdv, "lp": lp, "age": age, "m5": m5 or 0}
     if fdv <= MAX_FDV_USD and NEAR_MIN_LP <= lp <= NEAR_MAX_LP:
@@ -420,16 +420,13 @@ async def confirm_and_notify(session: httpx.AsyncClient, p: Dict[str, Any], prov
     addr = _addr_of(p) or "?"
     now = time.time()
 
-    # notify-once
     if now - notify_last.get(addr, 0) < NOTIFY_COOLDOWN_MIN * 60:
         return
 
-    # Gate: only call BirdEye when LP >= promotion LP (from current snapshot)
     lp_now = _lp_usd(p)
     if lp_now < PROMOTION_LP and not provisional_allowed:
         return
 
-    # BirdEye confirm (price/liquidity)
     bi = await birdeye_price_liq(session, addr)
     hel = await helius_holder_safety(session, addr)
 
@@ -440,7 +437,6 @@ async def confirm_and_notify(session: httpx.AsyncClient, p: Dict[str, Any], prov
         safety_ok = (hel.get("risk") == "ok")
     safety_flag = "OK" if safety_ok else "WARN"
 
-    # If BirdEye throttled and provisional allowed, fire a provisional
     if bi is None and provisional_allowed:
         await telegram_send(session, f"🧬 PROVISIONAL DING: {p.get('symbol') or '?'}\nLP≈${int(lp_now):,}\nhttps://birdeye.so/token/{addr}?chain=solana")
         await journal_ding(session, p, tier="Provisional", liq_at_ding=lp_now, safety=safety_flag)
@@ -450,16 +446,13 @@ async def confirm_and_notify(session: httpx.AsyncClient, p: Dict[str, Any], prov
     if bi is None:
         return
 
-    # Extract confirmed LP
     liq_field = bi.get("liquidity", {})
     liq_usd = (liq_field.get("usd") if isinstance(liq_field, dict) else liq_field) or lp_now
 
-    # Optional hard safety gate
     if SAFETY_REQUIRE_HELIUS_OK and not safety_ok:
         await telegram_send(session, f"👀 Watchlist (holder risk): {p.get('symbol') or '?'}\nTop1:{top1}% Top5:{top5}%\nhttps://birdeye.so/token/{addr}?chain=solana")
         return
 
-    # Strong ding
     sym = p.get("symbol") or "?"
     parts = [f"🧬 STRONG DING: {sym}", f"LP≈${int(float(liq_usd)):,}"]
     if top1 is not None and top5 is not None:
@@ -469,7 +462,7 @@ async def confirm_and_notify(session: httpx.AsyncClient, p: Dict[str, Any], prov
     await journal_ding(session, p, tier="Strong", liq_at_ding=liq_usd, safety=safety_flag)
     notify_last[addr] = now
 
-# ===================== Telegram basics ========================
+# ===================== Telegram ================================
 async def telegram_get_updates(session: httpx.AsyncClient, offset: int) -> list:
     if not TELEGRAM_BOT_TOKEN:
         return []
@@ -491,7 +484,6 @@ def _extract_mint(text: str) -> Optional[str]:
     m = re.search(r"(?:birdeye\.so/token|dexscreener\.com/solana)/([A-Za-z0-9]+)", text)
     return m.group(1) if m else None
 
-# ===================== Journal + /check =======================
 async def journal_manual_check(session: httpx.AsyncClient, mint: str, snap: Dict[str, Any], verdict: Dict[str, Any]):
     addr = mint
     row = {
@@ -509,7 +501,6 @@ async def journal_manual_check(session: httpx.AsyncClient, mint: str, snap: Dict
     if _changed("ManualChecks", addr, row):
         await sheet_append(session, "ManualChecks", row)
 
-# ===================== Manual /check auto-retry ===============
 async def manual_confirm_with_retry(session: httpx.AsyncClient, p: Dict[str, Any]):
     start = time.time()
     if PROVISIONAL_DING:
@@ -525,17 +516,13 @@ async def process_token(session: httpx.AsyncClient, p: Dict[str, Any]):
         return
     now_ts = time.time()
 
-    # cooldown per token
     if now_ts - seen_pairs.get(addr, 0) < COOLDOWN_MINUTES * 60:
         return
-    # reject memory
     if now_ts < reject_memory.get(addr, 0):
         return
 
-    # Ensure we have BirdEye-confirmed liqudity/fdv snapshot before verdict
     bi = await birdeye_price_liq(session, addr)
     if bi:
-        # merge bi into p for normalized access
         p = {
             **p,
             "liquidity": bi.get("liquidity"),
@@ -624,14 +611,17 @@ async def handle_telegram_updates(session: httpx.AsyncClient):
                     if not mint:
                         await telegram_send(session, "⚠️ /check needs a Solana mint or Birdeye/Dex URL")
                         continue
-                    # Pull BirdEye price/liquidity + try overview
                     bi = await birdeye_price_liq(session, mint)
                     ov = await birdeye_overview(session, mint)
-                    snap = {"address": mint, "symbol": (ov or {}).get("symbol") or (bi or {}).get("symbol") or "?", "liquidity": (bi or {}).get("liquidity"), "fdv": (bi or {}).get("fdv") or (ov or {}).get("fdv"), "createdAt": (ov or {}).get("createdAt")}
+                    snap = {
+                        "address": mint,
+                        "symbol": (ov or {}).get("symbol") or (bi or {}).get("symbol") or "?",
+                        "liquidity": (bi or {}).get("liquidity"),
+                        "fdv": (bi or {}).get("fdv") or (ov or {}).get("fdv"),
+                        "createdAt": (ov or {}).get("createdAt")
+                    }
                     sym = snap.get("symbol") or "?"
-                    fdv = _fdv_usd(snap)
-                    lp  = _lp_usd(snap)
-                    age = _pair_age_minutes(snap)
+                    fdv = _fdv_usd(snap); lp = _lp_usd(snap); age = _pair_age_minutes(snap)
                     await telegram_send(session, f"🔎 Scan {sym}: LP=${int(lp):,} | FDV=${int(fdv):,} | age={age:.1f}m")
                     v = dna_verdict(snap)
                     await telegram_send(session, f"🧪 DNA verdict: {v['status']} (why: {v['why']})")
@@ -659,26 +649,21 @@ async def discovery_cycle():
         while True:
             cycle_start = time.time()
             try:
-                # 1) BirdEye discovery
                 tokens = await birdeye_new_tokens(session, limit=120)
 
-                # 2) Optional Dex backup (less frequent)
                 if USE_DEX_BACKUP and (int(cycle_start) % DEX_BACKUP_CYCLE_SECONDS < BIRDCALL_CYCLE_SECONDS):
                     tokens.extend(await dexscreener_backup(session))
 
-                # De-dupe and prefer higher LP snapshots
                 tokens = best_by_token(tokens)
                 print(f"[loop] {utcnow_iso()} tokens={len(tokens)} builders={len(builder_watch)} near={len(near_watch)}")
 
-                # main scan
                 for t in tokens:
                     await process_token(session, t)
 
-                # follow-up queues (watchlists) — re-evaluate promotion using BirdEye LP
                 if builder_watch or near_watch:
                     await asyncio.sleep(WATCHLIST_RECHECK_SECONDS)
                     still_builder, still_near = {}, {}
-                    # Builders
+
                     for addr, exp in list(builder_watch.items()):
                         if time.time() > exp:
                             continue
@@ -690,13 +675,12 @@ async def discovery_cycle():
                             try: lp_now = float(lp_now)
                             except: lp_now = 0.0
                         if lp_now >= MIN_LIQ_USD:
-                            # Build a fresh snap
                             snap = {"address": addr, "symbol": (bi or {}).get("symbol") or "?", "liquidity": bi.get("liquidity") if bi else {"usd": lp_now}, "fdv": (bi or {}).get("fdv")}
                             await journal_candidate(session, snap, dna_verdict(snap))
                             await confirm_and_notify(session, snap, provisional_allowed=False)
                         else:
                             still_builder[addr] = exp
-                    # Near
+
                     for addr, exp in list(near_watch.items()):
                         if time.time() > exp:
                             continue
