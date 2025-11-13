@@ -1,16 +1,18 @@
-# ===================== MemeBot vNext — Bird Call =====================
+# ===================== MemeBot vNext — Bird Call (Dex Engine) =====================
 # Full bot with all your features kept:
 # - Keep-alive (Render) • Pairs-only / cooldowns • Reject memory
 # - Watchlist queues • Notify-once • Promotion LP gate
 # - Young TX leniency • Journal only-on-change
-# - BirdEye-first discovery with auto-fallback (token_list -> trending_tokens)
-# - /check uses BirdEye directly (also accepts Dex/Birdeye/pump links)
-# ====================================================================
+# - DexScreener as MAIN discovery (300 rpm-safe)  ✅
+# - BirdEye + Helius for confirmations (low volume) ✅
+# - /check uses BirdEye directly (accepts Dex/Birdeye/pump links) ✅
+# ================================================================================
 
 import os
 import re
 import asyncio
 import time
+import random
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -21,10 +23,14 @@ from aiohttp import web
 async def _health_handle(request):
     return web.Response(text="ok")
 
+async def _doorbell_handle(request):
+    # optional: refresh hint for caches (kept as no-op unless you wire caching)
+    return web.Response(text="ding")
+
 async def start_health_server():
     port = int(os.getenv("PORT", 10000))
     app = web.Application()
-    app.add_routes([web.get("/", _health_handle)])
+    app.add_routes([web.get("/", _health_handle), web.get("/doorbell", _doorbell_handle)])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -43,12 +49,13 @@ BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "").strip()
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "").strip()
 
 # Loop pacing / de-dup
-DEX_CYCLE_SECONDS      = int(os.getenv("DEX_CYCLE_SECONDS", "45"))
+DEX_CYCLE_SECONDS      = int(os.getenv("DEX_CYCLE_SECONDS", "60"))   # 45–60 is safe; 60 adds extra cushion
+DEX_JITTER_MAX_SECONDS = float(os.getenv("DEX_JITTER_MAX_SECONDS", "5"))  # tiny random delay before Dex call
 COOLDOWN_MINUTES       = int(os.getenv("COOLDOWN_MINUTES", "15"))  # per pair; suppress duplicate alerts
 NOTIFY_COOLDOWN_MIN    = int(os.getenv("NOTIFY_COOLDOWN_MIN", "15"))
 
-# Discovery feeds
-USE_SEARCH_FEED        = os.getenv("USE_SEARCH_FEED", "false").lower() == "true"  # (Dex legacy, safe to keep)
+# Discovery feeds (Dex legacy toggle kept)
+USE_SEARCH_FEED        = os.getenv("USE_SEARCH_FEED", "false").lower() == "true"
 REJECT_MEMORY_MINUTES  = int(os.getenv("REJECT_MEMORY_MINUTES", "180"))
 
 # DNA thresholds
@@ -56,7 +63,7 @@ MIN_LIQ_USD            = float(os.getenv("MIN_LIQ_USD", "20000"))   # floor for 
 MAX_FDV_USD            = float(os.getenv("MAX_FDV_USD", "600000"))  # cap for pass
 AGE_MAX_MINUTES        = float(os.getenv("AGE_MAX_MINUTES", "4320")) # 72h
 
-# Bands (kept for your logic; dna_verdict uses floor+cap now)
+# Bands (kept)
 BUILDER_MIN_LP         = float(os.getenv("BUILDER_MIN_LP", "9000"))
 BUILDER_MAX_LP         = float(os.getenv("BUILDER_MAX_LP", "15000"))
 NEAR_MIN_LP            = float(os.getenv("NEAR_MIN_LP", "15000"))
@@ -124,10 +131,8 @@ def _pair_age_minutes(p: Dict[str, Any]) -> float:
     ts = p.get("creationTime") or p.get("pairCreatedAt") or p.get("createdAt")
     try:
         ts = int(ts) if ts else 0
-        if ts <= 0:
-            return 9e9
-        if ts > 10**12:  # ms -> s
-            ts //= 1000
+        if ts <= 0: return 9e9
+        if ts > 10**12: ts //= 1000  # ms -> s
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
     except Exception:
@@ -137,8 +142,7 @@ def best_by_token(pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by = {}
     for p in pairs:
         t = _addr_of(p)
-        if not t:
-            continue
+        if not t: continue
         lp = _lp_usd(p)
         if t not in by or lp > by[t][0]:
             by[t] = (lp, p)
@@ -169,10 +173,8 @@ async def sheet_append(session: httpx.AsyncClient, tab: str, row: Dict[str, Any]
 
 # Only write to sheet when values actually changed
 _last_row_cache: Dict[Tuple[str,str], Dict[str,Any]] = {}  # (tab, addr) -> last payload
-
 def _changed(tab: str, addr: str, row: Dict[str, Any]) -> bool:
-    if not JOURNAL_ONLY_ON_CHANGE:
-        return True
+    if not JOURNAL_ONLY_ON_CHANGE: return True
     key = (tab, addr or "?")
     prev = _last_row_cache.get(key)
     if prev is None or prev != row:
@@ -180,11 +182,13 @@ def _changed(tab: str, addr: str, row: Dict[str, Any]) -> bool:
         return True
     return False
 
-# ===================== Dex (legacy, kept) =====================
+# ===================== Dex (ENGINE) ===========================
 async def dexscreener_latest(session: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    # Primary bulk feed (300 rpm-safe). We call it once per loop (+ optional USE_SEARCH_FEED).
     endpoints = ["https://api.dexscreener.com/latest/dex/pairs/solana"]
     if USE_SEARCH_FEED:
         endpoints.append("https://api.dexscreener.com/latest/dex/search?q=solana")
+
     out: List[Dict[str, Any]] = []
     for url in endpoints:
         for attempt in range(3):
@@ -206,24 +210,25 @@ async def dexscreener_latest(session: httpx.AsyncClient) -> List[Dict[str, Any]]
                 pairs = data.get("pairs") or data.get("tokens") or []
                 if not isinstance(pairs, list):
                     pairs = []
+                # solana only
                 pairs = [p for p in pairs if (p.get("chainId") or p.get("chain")) == "solana"]
                 out.extend(pairs)
                 break
             except Exception as e:
                 print(f"[dex] error {url}: {e}")
                 await asyncio.sleep(1.5)
+
     # de-dupe by token address
     seen: set = set()
     dedup: List[Dict[str, Any]] = []
     for p in out:
         k = _addr_of(p) or p.get("url") or p.get("pairAddress") or ""
-        if not k or k in seen:
-            continue
+        if not k or k in seen: continue
         seen.add(k)
         dedup.append(p)
     return dedup
 
-# ===================== BirdEye helpers ========================
+# ===================== BirdEye helpers (confirmers) ===========
 def _be_headers():
     return {"X-API-KEY": BIRDEYE_API_KEY, "accept": "application/json"}
 
@@ -247,15 +252,13 @@ async def birdeye_price_liq(session: httpx.AsyncClient, token_address: str) -> O
         print(f"[birdeye] error: {e}")
         return None
 
-# ---- BirdEye discovery with auto-fallback (token_list -> trending_tokens)
+# (kept) BirdEye discovery utility with auto-fallback – not used as engine now, but left intact
 async def birdeye_new_tokens(session: httpx.AsyncClient, limit: int = 120) -> List[Dict[str, Any]]:
     if not BIRDEYE_API_KEY:
         return []
-
     def _norm(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         mint = t.get("address") or t.get("mint") or t.get("tokenAddress") or t.get("mintAddress")
-        if not mint:
-            return None
+        if not mint: return None
         return {
             "baseToken": {"address": mint, "symbol": t.get("symbol") or t.get("ticker") or "?"},
             "url": f"https://birdeye.so/token/{mint}?chain=solana",
@@ -266,12 +269,10 @@ async def birdeye_new_tokens(session: httpx.AsyncClient, limit: int = 120) -> Li
             "chain": "solana",
             "chainId": "solana",
         }
-
     attempts = [
         ("token_list",      {"chain": "solana", "sort_by": "createdAt", "sort_type": "desc", "limit": str(limit)}),
         ("trending_tokens", {"chain": "solana", "sort_by": "rank",      "sort_type": "asc",  "limit": str(limit)}),
     ]
-
     out: List[Dict[str, Any]] = []
     for endpoint, params in attempts:
         url = f"https://public-api.birdeye.so/defi/{endpoint}"
@@ -286,13 +287,11 @@ async def birdeye_new_tokens(session: httpx.AsyncClient, limit: int = 120) -> Li
                 print(f"[birdeye] {endpoint} {r.status_code} {r.text[:140]}")
         except Exception as e:
             print(f"[birdeye] {endpoint} error: {e}")
-
     # de-dupe by mint
     seen, dedup = set(), []
     for p in out:
         a = (p.get("baseToken") or {}).get("address") or ""
-        if a in seen: 
-            continue
+        if a in seen: continue
         seen.add(a); dedup.append(p)
     return dedup
 
@@ -331,10 +330,10 @@ def _meets_tx_gate(age_min: float, m5: int) -> bool:
     return m5 >= MIN_TXNS_5M_OLD
 
 def dna_verdict(p: Dict[str, Any]) -> Dict[str, Any]:
-    fdv = _fdv_usd(p) if isinstance(p, dict) and "fdv" in p else p.get("fdv", 0) if isinstance(p, dict) else 0
-    lp  = _lp_usd(p)  if isinstance(p, dict) else p.get("lp", 0)
-    age = _pair_age_minutes(p) if isinstance(p, dict) else p.get("age", 9e9)
-    m5  = _txns_m5(p) if isinstance(p, dict) else p.get("m5", 0)
+    fdv = _fdv_usd(p)
+    lp  = _lp_usd(p)
+    age = _pair_age_minutes(p)
+    m5  = _txns_m5(p)
 
     if fdv <= 0 or lp <= 0:
         return {"status": "reject", "why": "missing fdv/liq", "fdv": fdv, "lp": lp, "age": age, "m5": m5}
@@ -559,7 +558,7 @@ async def handle_telegram_updates(session: httpx.AsyncClient):
                 low = text.lower()
                 if low.startswith("/start"):
                     await telegram_send(session,
-                        "👋 Bird Call online.\n"
+                        "👋 Bot online (Dex engine).\n"
                         f"Sheet: {GOOGLE_SHEET_URL or 'not set'}\n"
                         "Commands: /ping /dna /check <mint-or-url> /help")
                 elif low.startswith("/ping"):
@@ -568,7 +567,7 @@ async def handle_telegram_updates(session: httpx.AsyncClient):
                     await telegram_send(session, "Commands: /ping /dna /check <mint-or-url> /help")
                 elif low.startswith("/dna"):
                     await telegram_send(session,
-                        "🧬 Bird Call DNA:\n"
+                        "🧬 DNA settings:\n"
                         f"- LP floor: ${int(MIN_LIQ_USD):,} (promotion @{int(PROMOTION_LP):,})\n"
                         f"- FDV cap:  ${int(MAX_FDV_USD):,}\n"
                         f"- Builder:  ${int(BUILDER_MIN_LP):,}–${int(BUILDER_MAX_LP):,}\n"
@@ -586,7 +585,7 @@ async def handle_telegram_updates(session: httpx.AsyncClient):
                         await telegram_send(session, "⚠️ /check needs a Solana mint or Birdeye/Dex URL")
                         continue
 
-                    # --- BirdEye (direct) ---
+                    # --- BirdEye (direct) for clean one-off stats ---
                     try:
                         r = await session.get(
                             "https://public-api.birdeye.so/defi/price",
@@ -632,7 +631,6 @@ async def handle_telegram_updates(session: httpx.AsyncClient):
 
                     if v["status"] == "pass":
                         # try confirm path too (notify-once inside)
-                        # craft a pair-like obj so confirm pipeline works
                         p = {
                             "baseToken": {"address": mint, "symbol": data.get("symbol") or "?"},
                             "url": f"https://birdeye.so/token/{mint}?chain=solana",
@@ -654,18 +652,24 @@ async def discovery_cycle():
         asyncio.create_task(handle_telegram_updates(session))
         await telegram_send(session, f"✅ Bot live @ {utcnow_iso()}\nSheet: {GOOGLE_SHEET_URL or 'not set'}")
         backoff = 0
+        loop_count = 0
         while True:
             cycle_start = time.time()
             try:
-                # BirdEye-first discovery with auto-fallback
-                pairs = best_by_token(await birdeye_new_tokens(session))
+                loop_count += 1
+                # tiny jitter to avoid shared-IP sync
+                if DEX_JITTER_MAX_SECONDS > 0:
+                    await asyncio.sleep(random.uniform(0, DEX_JITTER_MAX_SECONDS))
+
+                # === Dex engine (300 rpm-safe) ===
+                pairs = best_by_token(await dexscreener_latest(session))
                 print(f"[loop] {utcnow_iso()} tokens={len(pairs)} builders={len(builder_watch)} near={len(near_watch)}")
 
                 # main scan
                 for p in pairs:
                     await process_pair(session, p)
 
-                # follow-up queues (watchlists)
+                # follow-up queues (watchlists) — recheck with BirdEye (no extra Dex spam)
                 if builder_watch or near_watch:
                     await asyncio.sleep(WATCHLIST_RECHECK_SECONDS)
                     still_builder, still_near = {}, {}
@@ -682,7 +686,8 @@ async def discovery_cycle():
                             try: lp_now = float(lp_now)
                             except: lp_now = 0.0
                         if lp_now >= MIN_LIQ_USD:
-                            now_pairs = best_by_token(await birdeye_new_tokens(session))
+                            # get a fresh snapshot set; prefer Dex engine snapshot
+                            now_pairs = best_by_token(await dexscreener_latest(session))
                             for p2 in now_pairs:
                                 if _addr_of(p2) == addr:
                                     await journal_candidate(session, p2, dna_verdict(p2))
@@ -703,7 +708,7 @@ async def discovery_cycle():
                             try: lp_now = float(lp_now)
                             except: lp_now = 0.0
                         if lp_now >= MIN_LIQ_USD:
-                            now_pairs = best_by_token(await birdeye_new_tokens(session))
+                            now_pairs = best_by_token(await dexscreener_latest(session))
                             for p2 in now_pairs:
                                 if _addr_of(p2) == addr:
                                     await journal_candidate(session, p2, dna_verdict(p2))
@@ -727,10 +732,10 @@ async def discovery_cycle():
 
 # ===================== Entrypoint ==============================
 def main():
-    print("Starting Bird Call (BirdEye-first with auto-fallback).")
+    print("Starting MemeBot — Dex engine (300 rpm-safe).")
     print(f"Keys: BirdEye={'yes' if BIRDEYE_API_KEY else 'no'} | Helius={'yes' if HELIUS_API_KEY else 'no'}")
     print(f"Sheet: {GOOGLE_SHEET_URL or 'not set'}  (webhook: {'yes' if SHEET_WEBHOOK_URL else 'no'})")
-    print(f"Cycle: BirdCall={DEX_CYCLE_SECONDS}s | WatchRecheck={WATCHLIST_RECHECK_SECONDS}s | WatchWindow={WATCHLIST_WINDOW_SECONDS}s")
+    print(f"Cycle: Dex={DEX_CYCLE_SECONDS}s | Jitter≤{DEX_JITTER_MAX_SECONDS}s | WatchRecheck={WATCHLIST_RECHECK_SECONDS}s | WatchWindow={WATCHLIST_WINDOW_SECONDS}s")
     print(f"DNA: LPfloor={MIN_LIQ_USD} | PromoLP={PROMOTION_LP} | FDVcap={MAX_FDV_USD} | Age≤{AGE_MAX_MINUTES}m | TX young/old={MIN_TXNS_5M_YOUNG}/{MIN_TXNS_5M_OLD}")
     asyncio.run(discovery_cycle())
 
