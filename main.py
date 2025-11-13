@@ -1,12 +1,12 @@
-# ===================== MemeBot vNext — Bird Call (Dex Engine) =====================
-# Full bot with all your features kept:
-# - Keep-alive (Render) • Pairs-only / cooldowns • Reject memory
-# - Watchlist queues • Notify-once • Promotion LP gate
-# - Young TX leniency • Journal only-on-change
-# - DexScreener as MAIN discovery (300 rpm-safe)  ✅
-# - BirdEye + Helius for confirmations (low volume) ✅
-# - /check uses BirdEye directly (accepts Dex/Birdeye/pump links) ✅
-# ================================================================================
+
+# ===================== MemeBot vNext — BIRD DROP =====================
+# Dex engine + BirdEye optional confirm (with fallback)
+#
+# - DexScreener = main discovery + /check engine
+# - BirdEye + Helius = extra safety when available
+# - If BirdEye returns nothing, we FALL BACK to Dex LP and still ding + journal
+# - DNA, watchlists, journaling, cooldowns, Telegram all preserved
+# =====================================================================
 
 import os
 import re
@@ -24,7 +24,7 @@ async def _health_handle(request):
     return web.Response(text="ok")
 
 async def _doorbell_handle(request):
-    # optional: refresh hint for caches (kept as no-op unless you wire caching)
+    # placeholder route; can be used later for external "ping" if needed
     return web.Response(text="ding")
 
 async def start_health_server():
@@ -49,26 +49,26 @@ BIRDEYE_API_KEY    = os.getenv("BIRDEYE_API_KEY", "").strip()
 HELIUS_API_KEY     = os.getenv("HELIUS_API_KEY", "").strip()
 
 # Loop pacing / de-dup
-DEX_CYCLE_SECONDS      = int(os.getenv("DEX_CYCLE_SECONDS", "60"))   # 45–60 is safe; 60 adds extra cushion
-DEX_JITTER_MAX_SECONDS = float(os.getenv("DEX_JITTER_MAX_SECONDS", "5"))  # tiny random delay before Dex call
-COOLDOWN_MINUTES       = int(os.getenv("COOLDOWN_MINUTES", "15"))  # per pair; suppress duplicate alerts
+DEX_CYCLE_SECONDS      = int(os.getenv("DEX_CYCLE_SECONDS", "60"))   # 45–60 is safe
+DEX_JITTER_MAX_SECONDS = float(os.getenv("DEX_JITTER_MAX_SECONDS", "5"))
+COOLDOWN_MINUTES       = int(os.getenv("COOLDOWN_MINUTES", "15"))   # per pair; suppress duplicate alerts
 NOTIFY_COOLDOWN_MIN    = int(os.getenv("NOTIFY_COOLDOWN_MIN", "15"))
 
-# Discovery feeds (Dex legacy toggle kept)
+# Discovery feeds (legacy toggle kept but we default to single endpoint)
 USE_SEARCH_FEED        = os.getenv("USE_SEARCH_FEED", "false").lower() == "true"
 REJECT_MEMORY_MINUTES  = int(os.getenv("REJECT_MEMORY_MINUTES", "180"))
 
 # DNA thresholds
-MIN_LIQ_USD            = float(os.getenv("MIN_LIQ_USD", "20000"))   # floor for pass
-MAX_FDV_USD            = float(os.getenv("MAX_FDV_USD", "600000"))  # cap for pass
+MIN_LIQ_USD            = float(os.getenv("MIN_LIQ_USD", "20000"))    # floor for pass
+MAX_FDV_USD            = float(os.getenv("MAX_FDV_USD", "600000"))   # cap for pass
 AGE_MAX_MINUTES        = float(os.getenv("AGE_MAX_MINUTES", "4320")) # 72h
 
-# Bands (kept)
+# Bands
 BUILDER_MIN_LP         = float(os.getenv("BUILDER_MIN_LP", "9000"))
 BUILDER_MAX_LP         = float(os.getenv("BUILDER_MAX_LP", "15000"))
 NEAR_MIN_LP            = float(os.getenv("NEAR_MIN_LP", "15000"))
 NEAR_MAX_LP            = float(os.getenv("NEAR_MAX_LP", "24900"))
-PROMOTION_LP           = float(os.getenv("PROMOTION_LP", "25000"))  # BirdEye/Helius gate
+PROMOTION_LP           = float(os.getenv("PROMOTION_LP", "25000"))   # BirdEye/Helius gate
 
 # TX leniency
 YOUNG_AGE_MINUTES      = float(os.getenv("YOUNG_AGE_MINUTES", "30"))
@@ -131,8 +131,10 @@ def _pair_age_minutes(p: Dict[str, Any]) -> float:
     ts = p.get("creationTime") or p.get("pairCreatedAt") or p.get("createdAt")
     try:
         ts = int(ts) if ts else 0
-        if ts <= 0: return 9e9
-        if ts > 10**12: ts //= 1000  # ms -> s
+        if ts <= 0:
+            return 9e9
+        if ts > 10**12:
+            ts //= 1000  # ms -> s
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
     except Exception:
@@ -142,7 +144,8 @@ def best_by_token(pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     by = {}
     for p in pairs:
         t = _addr_of(p)
-        if not t: continue
+        if not t:
+            continue
         lp = _lp_usd(p)
         if t not in by or lp > by[t][0]:
             by[t] = (lp, p)
@@ -174,7 +177,8 @@ async def sheet_append(session: httpx.AsyncClient, tab: str, row: Dict[str, Any]
 # Only write to sheet when values actually changed
 _last_row_cache: Dict[Tuple[str,str], Dict[str,Any]] = {}  # (tab, addr) -> last payload
 def _changed(tab: str, addr: str, row: Dict[str, Any]) -> bool:
-    if not JOURNAL_ONLY_ON_CHANGE: return True
+    if not JOURNAL_ONLY_ON_CHANGE:
+        return True
     key = (tab, addr or "?")
     prev = _last_row_cache.get(key)
     if prev is None or prev != row:
@@ -184,7 +188,7 @@ def _changed(tab: str, addr: str, row: Dict[str, Any]) -> bool:
 
 # ===================== Dex (ENGINE) ===========================
 async def dexscreener_latest(session: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    # Primary bulk feed (300 rpm-safe). We call it once per loop (+ optional USE_SEARCH_FEED).
+    # Primary bulk feed (very generous limits). We call it once per loop.
     endpoints = ["https://api.dexscreener.com/latest/dex/pairs/solana"]
     if USE_SEARCH_FEED:
         endpoints.append("https://api.dexscreener.com/latest/dex/search?q=solana")
@@ -223,12 +227,28 @@ async def dexscreener_latest(session: httpx.AsyncClient) -> List[Dict[str, Any]]
     dedup: List[Dict[str, Any]] = []
     for p in out:
         k = _addr_of(p) or p.get("url") or p.get("pairAddress") or ""
-        if not k or k in seen: continue
+        if not k or k in seen:
+            continue
         seen.add(k)
         dedup.append(p)
     return dedup
 
-# ===================== BirdEye helpers (confirmers) ===========
+async def dexscreener_search_by_mint(session: httpx.AsyncClient, mint: str) -> Optional[Dict[str, Any]]:
+    """Used by /check fallback and manual scans."""
+    try:
+        r = await session.get("https://api.dexscreener.com/latest/dex/search", params={"q": mint}, timeout=20)
+        data = r.json() if r.status_code < 300 else {}
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return None
+        # pick highest-LP pool
+        p = max(pairs, key=lambda x: (_lp_usd(x) or 0))
+        return p
+    except Exception as e:
+        print(f"[dex] search error: {e}")
+        return None
+
+# ===================== BirdEye helpers (optional) =============
 def _be_headers():
     return {"X-API-KEY": BIRDEYE_API_KEY, "accept": "application/json"}
 
@@ -251,49 +271,6 @@ async def birdeye_price_liq(session: httpx.AsyncClient, token_address: str) -> O
     except Exception as e:
         print(f"[birdeye] error: {e}")
         return None
-
-# (kept) BirdEye discovery utility with auto-fallback – not used as engine now, but left intact
-async def birdeye_new_tokens(session: httpx.AsyncClient, limit: int = 120) -> List[Dict[str, Any]]:
-    if not BIRDEYE_API_KEY:
-        return []
-    def _norm(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        mint = t.get("address") or t.get("mint") or t.get("tokenAddress") or t.get("mintAddress")
-        if not mint: return None
-        return {
-            "baseToken": {"address": mint, "symbol": t.get("symbol") or t.get("ticker") or "?"},
-            "url": f"https://birdeye.so/token/{mint}?chain=solana",
-            "creationTime": t.get("createdAt") or t.get("mintedAt") or t.get("creationTime") or 0,
-            "fdv": t.get("fdv") or 0,
-            "liquidity": {"usd": t.get("liquidityUsd") or 0},
-            "txns": {"m5": {"buys": 0, "sells": 0}},
-            "chain": "solana",
-            "chainId": "solana",
-        }
-    attempts = [
-        ("token_list",      {"chain": "solana", "sort_by": "createdAt", "sort_type": "desc", "limit": str(limit)}),
-        ("trending_tokens", {"chain": "solana", "sort_by": "rank",      "sort_type": "asc",  "limit": str(limit)}),
-    ]
-    out: List[Dict[str, Any]] = []
-    for endpoint, params in attempts:
-        url = f"https://public-api.birdeye.so/defi/{endpoint}"
-        try:
-            r = await session.get(url, headers=_be_headers(), params=params, timeout=25)
-            if r.status_code == 200:
-                data = r.json().get("data") or []
-                out = [x for x in (_norm(t) for t in data) if x]
-                print(f"[birdeye] {endpoint} 200 count={len(out)}")
-                break
-            else:
-                print(f"[birdeye] {endpoint} {r.status_code} {r.text[:140]}")
-        except Exception as e:
-            print(f"[birdeye] {endpoint} error: {e}")
-    # de-dupe by mint
-    seen, dedup = set(), []
-    for p in out:
-        a = (p.get("baseToken") or {}).get("address") or ""
-        if a in seen: continue
-        seen.add(a); dedup.append(p)
-    return dedup
 
 # ===================== Helius holder safety ===================
 async def helius_holder_safety(session: httpx.AsyncClient, token_mint: str) -> Optional[Dict[str, Any]]:
@@ -402,6 +379,11 @@ async def journal_ding(session: httpx.AsyncClient, p: Dict[str, Any], tier: str,
 
 # ===================== Confirmers & notify-once ================
 async def confirm_and_notify(session: httpx.AsyncClient, p: Dict[str, Any], provisional_allowed: bool = False):
+    """
+    BirdEye is OPTIONAL here:
+    - If BirdEye returns data -> use BirdEye LP.
+    - If BirdEye returns None -> FALL BACK to Dex LP and still ding + journal.
+    """
     addr = _addr_of(p) or "?"
 
     # notify-once window
@@ -410,41 +392,55 @@ async def confirm_and_notify(session: httpx.AsyncClient, p: Dict[str, Any], prov
     if now - last < NOTIFY_COOLDOWN_MIN * 60:
         return
 
-    # Gate: only call BirdEye when LP >= PROMOTION_LP (approx current snapshot)
+    # Gate: only confirm when LP is at / above promotion threshold
     lp_now = _lp_usd(p)
     if lp_now < PROMOTION_LP and not provisional_allowed:
         return
 
+    # Try BirdEye first (optional)
     bi = await birdeye_price_liq(session, addr)
     hel = await helius_holder_safety(session, addr)
 
     safety_ok = True
     top1 = top5 = None
     if hel:
-        top1 = hel.get("top1_pct"); top5 = hel.get("top5_pct")
+        top1 = hel.get("top1_pct")
+        top5 = hel.get("top5_pct")
         safety_ok = (hel.get("risk") == "ok")
 
     safety_flag = "OK" if safety_ok else "WARN"
 
+    # If BirdEye fails completely but we allow provisional, fire early hint
     if bi is None and provisional_allowed:
-        await telegram_send(session, f"🧬 PROVISIONAL DING: {(p.get('baseToken') or {}).get('symbol') or p.get('symbol') or '?'}\nLP≈${int(lp_now):,}\n{p.get('url') or ''}")
+        await telegram_send(
+            session,
+            f"🧬 PROVISIONAL DING (Dex LP only): "
+            f"{(p.get('baseToken') or {}).get('symbol') or p.get('symbol') or '?'}\n"
+            f"LP≈${int(lp_now):,}\n{p.get('url') or ''}"
+        )
         await journal_ding(session, p, tier="Provisional", liq_at_ding=lp_now, safety=safety_flag)
         notify_last[addr] = now
         return
 
+    # === NEW: fallback if BirdEye has no data ===
     if bi is None:
-        return  # no ding yet
-
-    # Extract BirdEye liquidity if present
-    liq_field = bi.get("liquidity", {})
-    liq_usd = (liq_field.get("usd") if isinstance(liq_field, dict) else liq_field) or lp_now
+        # No BirdEye data -> trust Dex LP and still proceed
+        liq_usd = lp_now
+    else:
+        liq_field = bi.get("liquidity", {})
+        liq_usd = (liq_field.get("usd") if isinstance(liq_field, dict) else liq_field) or lp_now
 
     # Safety enforcement (optional hard gate)
     if SAFETY_REQUIRE_HELIUS_OK and not safety_ok:
-        await telegram_send(session, f"👀 Watchlist (holder risk): {(p.get('baseToken') or {}).get('symbol') or p.get('symbol') or '?'}\nTop1:{top1}% Top5:{top5}%\n{p.get('url') or ''}")
+        await telegram_send(
+            session,
+            f"👀 Watchlist (holder risk): "
+            f"{(p.get('baseToken') or {}).get('symbol') or p.get('symbol') or '?'}\n"
+            f"Top1:{top1}% Top5:{top5}%\n{p.get('url') or ''}"
+        )
         return
 
-    # Strong ding
+    # Strong ding (either BirdEye LP or Dex LP)
     sym = (p.get("baseToken") or {}).get("symbol") or p.get("symbol") or "?"
     parts = [f"🧬 STRONG DING: {sym}", f"LP≈${int(float(liq_usd)):,}"]
     if top1 is not None and top5 is not None:
@@ -469,8 +465,9 @@ async def process_pair(session: httpx.AsyncClient, p: Dict[str, Any]):
     if not addr:
         return
 
-    # cooldown per pair
     now_ts = time.time()
+
+    # cooldown per pair
     last_seen = seen_pairs.get(addr, 0)
     if now_ts - last_seen < COOLDOWN_MINUTES * 60:
         return
@@ -485,7 +482,8 @@ async def process_pair(session: httpx.AsyncClient, p: Dict[str, Any]):
 
     if status == "reject":
         reject_memory[addr] = now_ts + REJECT_MEMORY_MINUTES * 60
-        builder_watch.pop(addr, None); near_watch.pop(addr, None)
+        builder_watch.pop(addr, None)
+        near_watch.pop(addr, None)
         return
 
     sym = (p.get("baseToken") or {}).get("symbol") or p.get("symbol") or "?"
@@ -495,7 +493,8 @@ async def process_pair(session: httpx.AsyncClient, p: Dict[str, Any]):
         seen_pairs[addr] = now_ts
         await journal_candidate(session, p, verdict)
         await confirm_and_notify(session, p, provisional_allowed=False)
-        builder_watch.pop(addr, None); near_watch.pop(addr, None)
+        builder_watch.pop(addr, None)
+        near_watch.pop(addr, None)
         return
 
     exp = now_ts + WATCHLIST_WINDOW_SECONDS
@@ -503,7 +502,10 @@ async def process_pair(session: httpx.AsyncClient, p: Dict[str, Any]):
         await journal_near(session, p, verdict, status="near")
         near_watch[addr] = exp
         if now_ts - notify_last.get(addr, 0) > NOTIFY_COOLDOWN_MIN * 60:
-            await telegram_send(session, f"🟨 Near-miss: {sym} LP≈${int(verdict['lp']):,} needs ≥ ${int(MIN_LIQ_USD):,}\n{url}")
+            await telegram_send(
+                session,
+                f"🟨 Near-miss: {sym} LP≈${int(verdict['lp']):,} needs ≥ ${int(MIN_LIQ_USD):,}\n{url}"
+            )
             notify_last[addr] = now_ts
         return
 
@@ -511,7 +513,10 @@ async def process_pair(session: httpx.AsyncClient, p: Dict[str, Any]):
         await journal_near(session, p, verdict, status="builder")
         builder_watch[addr] = exp
         if now_ts - notify_last.get(addr, 0) > NOTIFY_COOLDOWN_MIN * 60:
-            await telegram_send(session, f"🟧 Builder: {sym} LP≈${int(verdict['lp']):,}\n{url}")
+            await telegram_send(
+                session,
+                f"🟧 Builder: {sym} LP≈${int(verdict['lp']):,}\n{url}"
+            )
             notify_last[addr] = now_ts
         return
 
@@ -530,12 +535,13 @@ async def telegram_get_updates(session: httpx.AsyncClient, offset: int) -> list:
 
 LAST_UPDATE_ID = 0
 
-# Forgiving mint extractor: raw mint, Birdeye link, Dex link, Pump text
+# Forgiving mint extractor: raw mint, Birdeye link, Dex link, etc.
 def _extract_mint(text: str) -> Optional[str]:
     text = (text or "").strip()
     m = re.search(r"dexscreener\.com/solana/([A-Za-z0-9]+)", text)
     if m:
         return m.group(1)
+    # raw mint
     m = re.search(r"[1-9A-HJ-NP-Za-km-z]{32,44}", text)
     return m.group(0) if m else None
 
@@ -557,88 +563,87 @@ async def handle_telegram_updates(session: httpx.AsyncClient):
 
                 low = text.lower()
                 if low.startswith("/start"):
-                    await telegram_send(session,
-                        "👋 Bot online (Dex engine).\n"
+                    await telegram_send(
+                        session,
+                        "👋 Bird Drop online (Dex engine).\n"
                         f"Sheet: {GOOGLE_SHEET_URL or 'not set'}\n"
-                        "Commands: /ping /dna /check <mint-or-url> /help")
+                        "Commands: /ping /dna /check <mint-or-url> /help"
+                    )
                 elif low.startswith("/ping"):
                     await telegram_send(session, f"🏓 pong — {utcnow_iso()}")
                 elif low.startswith("/help"):
                     await telegram_send(session, "Commands: /ping /dna /check <mint-or-url> /help")
                 elif low.startswith("/dna"):
-                    await telegram_send(session,
-                        "🧬 DNA settings:\n"
+                    await telegram_send(
+                        session,
+                        "🧬 DNA settings (Bird Drop):\n"
                         f"- LP floor: ${int(MIN_LIQ_USD):,} (promotion @{int(PROMOTION_LP):,})\n"
                         f"- FDV cap:  ${int(MAX_FDV_USD):,}\n"
                         f"- Builder:  ${int(BUILDER_MIN_LP):,}–${int(BUILDER_MAX_LP):,}\n"
                         f"- Near:     ${int(NEAR_MIN_LP):,}–${int(NEAR_MAX_LP):,}\n"
                         f"- Age ≤ {int(AGE_MAX_MINUTES/60)}h (young≤{int(YOUNG_AGE_MINUTES)}m lenient)\n"
                         f"- 5m txns: young≥{MIN_TXNS_5M_YOUNG}, old≥{MIN_TXNS_5M_OLD}\n"
-                        f"- Cycle: {DEX_CYCLE_SECONDS}s (BE confirm pace {BIRDEYE_CYCLE_SECONDS}s)")
+                        f"- Cycle: {DEX_CYCLE_SECONDS}s (Dex engine; BirdEye optional confirm)"
+                    )
                 elif low.startswith("/check"):
                     parts = text.split(maxsplit=1)
                     if len(parts) == 1:
-                        await telegram_send(session, "Usage: /check <mint-or-birdeye/dex url>")
+                        await telegram_send(session, "Usage: /check <mint-or-dexscreener-url>")
                         continue
                     mint = _extract_mint(parts[1])
                     if not mint:
-                        await telegram_send(session, "⚠️ /check needs a Solana mint or Birdeye/Dex URL")
+                        await telegram_send(session, "⚠️ /check needs a Solana mint or DexScreener URL")
                         continue
 
-                    # --- BirdEye (direct) for clean one-off stats ---
-                    try:
-                        r = await session.get(
-                            "https://public-api.birdeye.so/defi/price",
-                            headers=_be_headers(),
-                            params={"chain": "solana", "address": mint, "include_liquidity": "true"},
-                            timeout=20
-                        )
-                        data = r.json().get("data") if r.status_code < 300 else None
-                    except Exception as e:
-                        await telegram_send(session, f"⚠️ BirdEye error: {e}")
-                        data = None
-
-                    if not data:
-                        await telegram_send(session, "❔ No BirdEye data found for that token.")
+                    # === Use Dex as main source for /check ===
+                    p = await dexscreener_search_by_mint(session, mint)
+                    if not p:
+                        await telegram_send(session, "❔ No pairs found for that mint yet.")
                         continue
 
-                    fdv = float(data.get("fdv") or data.get("marketCap") or 0)
-                    liq = data.get("liquidity", {})
-                    lp  = float((liq.get("usd") if isinstance(liq, dict) else liq) or 0)
-                    created = data.get("createdAt") or 0
-                    age_min = (datetime.now(timezone.utc).timestamp() - created / 1000) / 60 if created else 0
-                    m5 = int(data.get("txns_m5") or 0)
+                    sym = (p.get("baseToken") or {}).get("symbol") or p.get("symbol") or "?"
+                    lp  = _lp_usd(p)
+                    fdv = _fdv_usd(p)
+                    age = _pair_age_minutes(p)
+                    m5  = _txns_m5(p)
+                    url = p.get("url") or p.get("pairLink") or f"https://dexscreener.com/solana/{mint}"
 
-                    await telegram_send(session, f"📊 Scan {data.get('symbol') or '?'} LP=${int(lp):,} | FDV=${int(fdv):,} | age={age_min:.1f}m | tx5={m5}")
-                    v = dna_verdict({"fdv": fdv, "liquidity": {"usd": lp}, "creationTime": created, "txns": {"m5": {"buys": m5}}})
+                    await telegram_send(
+                        session,
+                        f"🔎 Scan {sym}: LP=${int(lp):,} | FDV=${int(fdv):,} | age={age:.1f}m | 5m txns={m5}"
+                    )
+
+                    v = dna_verdict(p)
                     await telegram_send(session, f"🧪 DNA verdict: {v['status']} (why: {v['why']})")
+
+                    addr = _addr_of(p) or mint
 
                     # Journal manual check
                     row = {
                         "ts_check": utcnow_iso(),
-                        "pair_address": mint,
-                        "symbol": data.get("symbol") or "?",
+                        "pair_address": addr,
+                        "symbol": sym,
                         "fdv": fdv,
                         "lp": lp,
-                        "age_min": round(age_min, 2),
+                        "age_min": round(age, 2),
                         "tx5": m5,
                         "verdict": v["status"],
                         "why": v["why"],
-                        "url": f"https://birdeye.so/token/{mint}?chain=solana",
+                        "url": url,
                     }
-                    if _changed("ManualChecks", mint, row):
+                    if _changed("ManualChecks", addr, row):
                         await sheet_append(session, "ManualChecks", row)
 
                     if v["status"] == "pass":
-                        # try confirm path too (notify-once inside)
-                        p = {
-                            "baseToken": {"address": mint, "symbol": data.get("symbol") or "?"},
-                            "url": f"https://birdeye.so/token/{mint}?chain=solana",
-                            "fdv": fdv, "liquidity": {"usd": lp}, "creationTime": created,
-                            "txns": {"m5": {"buys": m5, "sells": 0}}, "chainId": "solana"
-                        }
                         await journal_candidate(session, p, v)
+                        # Try full confirm path (BirdEye optional, Dex fallback)
                         await manual_confirm_with_retry(session, p)
+                    elif v["status"] in ("near", "builder"):
+                        await journal_near(session, p, v, status=v["status"])
+                        await confirm_and_notify(session, p, provisional_allowed=False)
+                    else:
+                        # rejected -> remember briefly
+                        reject_memory[addr] = time.time() + REJECT_MEMORY_MINUTES * 60
 
             except Exception as e:
                 print(f"[tg] handle error: {e}")
@@ -650,18 +655,22 @@ async def discovery_cycle():
     async with httpx.AsyncClient(timeout=30) as session:
         await start_health_server()
         asyncio.create_task(handle_telegram_updates(session))
-        await telegram_send(session, f"✅ Bot live @ {utcnow_iso()}\nSheet: {GOOGLE_SHEET_URL or 'not set'}")
+        await telegram_send(
+            session,
+            f"✅ Bird Drop live @ {utcnow_iso()}\nSheet: {GOOGLE_SHEET_URL or 'not set'}"
+        )
         backoff = 0
         loop_count = 0
         while True:
             cycle_start = time.time()
             try:
                 loop_count += 1
+
                 # tiny jitter to avoid shared-IP sync
                 if DEX_JITTER_MAX_SECONDS > 0:
                     await asyncio.sleep(random.uniform(0, DEX_JITTER_MAX_SECONDS))
 
-                # === Dex engine (300 rpm-safe) ===
+                # Dex engine discovery
                 pairs = best_by_token(await dexscreener_latest(session))
                 print(f"[loop] {utcnow_iso()} tokens={len(pairs)} builders={len(builder_watch)} near={len(near_watch)}")
 
@@ -669,7 +678,7 @@ async def discovery_cycle():
                 for p in pairs:
                     await process_pair(session, p)
 
-                # follow-up queues (watchlists) — recheck with BirdEye (no extra Dex spam)
+                # follow-up queues (watchlists) — recheck with BirdEye (no extra Dex spam unless promoted)
                 if builder_watch or near_watch:
                     await asyncio.sleep(WATCHLIST_RECHECK_SECONDS)
                     still_builder, still_near = {}, {}
@@ -683,10 +692,12 @@ async def discovery_cycle():
                         if bi:
                             liq = bi.get("liquidity", {})
                             lp_now = (liq.get("usd") if isinstance(liq, dict) else liq) or 0
-                            try: lp_now = float(lp_now)
-                            except: lp_now = 0.0
+                            try:
+                                lp_now = float(lp_now)
+                            except Exception:
+                                lp_now = 0.0
                         if lp_now >= MIN_LIQ_USD:
-                            # get a fresh snapshot set; prefer Dex engine snapshot
+                            # get a fresh Dex snapshot
                             now_pairs = best_by_token(await dexscreener_latest(session))
                             for p2 in now_pairs:
                                 if _addr_of(p2) == addr:
@@ -705,8 +716,10 @@ async def discovery_cycle():
                         if bi:
                             liq = bi.get("liquidity", {})
                             lp_now = (liq.get("usd") if isinstance(liq, dict) else liq) or 0
-                            try: lp_now = float(lp_now)
-                            except: lp_now = 0.0
+                            try:
+                                lp_now = float(lp_now)
+                            except Exception:
+                                lp_now = 0.0
                         if lp_now >= MIN_LIQ_USD:
                             now_pairs = best_by_token(await dexscreener_latest(session))
                             for p2 in now_pairs:
@@ -732,7 +745,7 @@ async def discovery_cycle():
 
 # ===================== Entrypoint ==============================
 def main():
-    print("Starting MemeBot — Dex engine (300 rpm-safe).")
+    print("Starting Bird Drop — Dex engine with BirdEye fallback.")
     print(f"Keys: BirdEye={'yes' if BIRDEYE_API_KEY else 'no'} | Helius={'yes' if HELIUS_API_KEY else 'no'}")
     print(f"Sheet: {GOOGLE_SHEET_URL or 'not set'}  (webhook: {'yes' if SHEET_WEBHOOK_URL else 'no'})")
     print(f"Cycle: Dex={DEX_CYCLE_SECONDS}s | Jitter≤{DEX_JITTER_MAX_SECONDS}s | WatchRecheck={WATCHLIST_RECHECK_SECONDS}s | WatchWindow={WATCHLIST_WINDOW_SECONDS}s")
@@ -741,4 +754,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
